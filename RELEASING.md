@@ -36,12 +36,19 @@ Both registries verify the detached signature of `..._SHA256SUMS` with a public 
 
 3. Store the **private key** and its **passphrase** as repository secrets in GitHub (Settings, Secrets and variables, Actions): `GPG_PRIVATE_KEY` (content of the private `.asc`) and `PASSPHRASE`. GoReleaser in CI cannot answer a passphrase prompt, which is why the workflow imports the key with these secrets. Keep a backup of the private key in the team password manager; delete the loose file.
 
-### 2. Terraform Registry (registry.terraform.io)
+### 2. Terraform Registry (via HCP Terraform public namespaces)
 
-1. In the Registry, sign in with GitHub. The account needs the OAuth access to the `prepaid-host` organisation (an organisation admin may have to approve the Registry app once).
-2. Add the **public key**: User Settings, Signing Keys, choose the **`prepaid-host` namespace**, paste `prepaidhost-public.asc`. Only an organisation admin can add keys to the namespace.
-3. Publish, Provider, choose organisation `prepaid-host` and the repository `terraform-provider-prepaidhost` (public, name must match `terraform-provider-{NAME}`, lower case).
-4. The Registry creates a webhook on the repository for release events and ingests every new release from it. If new versions stop appearing: delete the old `registry.terraform.io` webhooks of the repository and use **Resync** on the provider's settings page.
+Public providers are published through a public namespace in HCP Terraform; after that the namespace is managed there, not on registry.terraform.io.
+
+1. Sign up at <https://app.terraform.io> (free). **Do not choose the EU region** — it has no public namespaces. Create an organisation; as its creator you are in the Owners team, which is required.
+2. Install the **Terraform Cloud** GitHub App on the GitHub organisation `prepaid-host` (needs organisation-admin rights on GitHub; granting it access to all repositories is simplest, at least to `terraform-provider-prepaidhost`).
+3. In HCP Terraform: your organisation, Registry, Public namespaces, **New Namespace**, select the GitHub account `prepaid-host` (if it is missing, use "Add GitHub Account" to reinstall the app), **Create Namespace** ("Claim Namespace" if it was used on the Registry before).
+4. In the namespace, add the **public key** (`prepaidhost-public.asc`) as signing key. Without it, signature verification fails when publishing. It must be the key the releases are signed with (RSA, not ECC).
+5. In the namespace: Publish, Provider, choose `terraform-provider-prepaidhost`, pick a category, accept the terms, **Publish provider**. HCP lists every version from the repository with its status; every new GitHub release is picked up automatically from then on.
+6. If a version is missing: in the namespace, on the provider, "…", **Resync**. A signature error almost always means an ECC key or a different key in the namespace than the one used for signing.
+7. Never replace a published version — tag a new one. Deleting is only possible within 48 h or while a version has at most 100 downloads.
+
+Docs can be previewed before a release at <https://registry.terraform.io/tools/doc-preview>.
 
 ### 3. OpenTofu Registry (search.opentofu.org)
 
