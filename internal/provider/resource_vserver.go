@@ -207,7 +207,7 @@ func (r *vserverResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			"one-time change of `auto_renew` from false to true.\n\n" +
 			"Rarely, a server whose rental record was removed on the platform makes reads fail with HTTP 500; remove it " +
 			"with `terraform state rm` then.\n\n" +
-			"Needs a token with the scopes `orders:write` (ordering), `rootserver:read`, `rootserver:network:read` " +
+			"Needs a token with the scopes `rootserver:order` (ordering), `rootserver:read`, `rootserver:network:read` " +
 			"(addresses) and `rootserver:renew` (auto-renew).",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{

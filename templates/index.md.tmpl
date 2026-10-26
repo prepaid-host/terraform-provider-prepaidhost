@@ -1,0 +1,47 @@
+---
+page_title: "Provider: {{ .RenderedProviderName }}"
+description: |-
+  Order and manage Prepaid-Host vServers, domains, DNS records, SSH keys and domain contacts with Terraform or OpenTofu.
+---
+
+# {{ .RenderedProviderName }} Provider
+
+The Prepaid-Host provider orders and manages [Prepaid-Host](https://prepaid-host.com) resources: vServers, domains, DNS records, SSH keys and domain contacts. It works the same with Terraform and OpenTofu.
+
+**Orders are paid from the prepaid balance of your account.** Creating a `prepaidhost_vserver` or `prepaidhost_domain` charges the balance immediately. Read this page before the first `apply`.
+
+## Before you start
+
+1. **Create an API token with the order scopes** in the customer panel. Ordering needs `rootserver:order` for vServers and `domain:order` for domains; add the read scopes the resources list on their pages (for example `rootserver:read`, `domain:read`, `domain:dns:write`, `account:sshkeys`, `domain:contact`, `account:billing`).
+2. **Consent while creating the token.** An order token is created in the customer panel only, and creating it records your consent to the terms and conditions (AGB), the cancellation policy (Widerruf) and the immediate execution of orders. A token without this consent cannot order.
+3. **Top up the balance in the customer panel first.** The provider never tops up. If the balance is too short, the order is refused with `INSUFFICIENT_BALANCE` and the error names the missing amount. Nothing is charged and nothing is written to the state.
+4. **Keep the token secret.** Pass it with the `PREPAIDHOST_TOKEN` environment variable or a variable marked `sensitive = true`. The token is a sensitive provider argument, so it is masked in plan output, but Terraform and OpenTofu keep sensitive values in the state file in plain text. Protect the state: use an encrypted remote backend (OpenTofu can also encrypt state itself) and do not commit it. The vServer `password` is write-only (Terraform 1.11+ / OpenTofu 1.11+) and never stored in the state.
+
+## Example usage
+
+The `source` is valid for Terraform and OpenTofu:
+
+{{ tffile "examples/provider/provider.tf" }}
+
+## What happens on apply, destroy and re-apply
+
+| Action | What it does |
+|--------|--------------|
+| `apply` of a new `prepaidhost_vserver` or `prepaidhost_domain` | Asks for a price quote, checks `max_price`, then orders with an idempotency key derived from the configuration and waits until the item is active. The balance is charged once. |
+| `apply` repeated after an abort (timeout, killed process) | Gets the paid order back instead of buying again. If the wait ran out, raise `create_timeout`. |
+| Changing a purchase argument (memory, packet, duration, name, ...) | **Plan error.** The provider never buys again silently and never replaces a paid resource. |
+| `destroy` | **Cancels, it does not delete:** auto-renew is switched off and the resource runs until `expires_at`. **There is no refund.** |
+| `apply` of the same configuration after `destroy`, before expiry | Takes the resource over again, switches auto-renew back on and does not buy again. |
+
+### Existing resources
+
+- A resource ordered through the API (by this provider) is found again by its client reference: the **hostname** of a vServer, the **name** of a domain. The same configuration takes it over without a new purchase, with a warning.
+- A resource ordered **in the customer panel** has no such reference and must be imported with `terraform import` (or `tofu import`). Ordering a panel-registered domain name again is refused by the registrar.
+- The `hostname` of a vServer is immutable; to rename the server in the panel, use `display_name`.
+- **Domain transfers are not available through the API or the provider.** Transfer the domain in the customer panel and import it.
+
+### Cost protection
+
+Set `max_price` (in EUR) on `prepaidhost_vserver` and `prepaidhost_domain`. If the quote is higher, the order fails before anything is charged. The binding price is always the quote of the order; the `prepaidhost_catalog` data source shows indicative prices. The `prepaidhost_balance` data source reads the current balance (for example for a `precondition`).
+
+{{ .SchemaMarkdown | trimspace }}

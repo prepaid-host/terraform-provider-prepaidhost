@@ -151,7 +151,7 @@ func (r *domainResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"A domain deleted outside Terraform is removed from the state. A domain whose term expired stays in the state " +
 			"with `status = \"expired\"` as long as the API lists it: the platform does not renew it any more; renew it in the " +
 			"panel while the registry allows it, or destroy it.\n\n" +
-			"Needs a token with the scopes `orders:write` (ordering), `domain:read`, `domain:renew` (term and auto-renew) and " +
+			"Needs a token with the scopes `domain:order` (ordering), `domain:read`, `domain:renew` (term and auto-renew) and " +
 			"`domain:nameserver` (only when `nameservers` is set).",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{

@@ -2,7 +2,7 @@
 
 The `prepaid-host/prepaidhost` provider manages [Prepaid-Host](https://prepaid-host.com) resources with Terraform or OpenTofu: SSH keys, domain contacts, vServers, domains and DNS records. Orders are paid from the prepaid balance of your account.
 
-> **Status:** in development, not yet published in the Terraform or OpenTofu Registry.
+> **Status:** in development, not yet published in the Terraform or OpenTofu Registry. Documentation: [`docs/`](docs/index.md). Release process: [RELEASING.md](RELEASING.md).
 
 ## Usage
 
@@ -41,6 +41,7 @@ make build      # go build ./...
 make lint       # golangci-lint run
 make test       # unit tests
 make testacc    # acceptance-style tests with the tofu/terraform binary
+go generate ./... # regenerate docs/ (tfplugindocs)
 ```
 
 All tests run against an in-process mock of the API (`internal/testapi`); no test talks to the real API or spends balance. `make testacc` sets `TF_ACC=1`, `TF_ACC_TERRAFORM_PATH` (tofu, else terraform) and `TF_ACC_PROVIDER_NAMESPACE=prepaid-host`.

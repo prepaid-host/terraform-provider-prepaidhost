@@ -13,6 +13,11 @@ import (
 	"github.com/prepaid-host/terraform-provider-prepaidhost/internal/provider"
 )
 
+// Generate the registry documentation (docs/) from the provider schema, the
+// templates/ and the examples/. Needs a terraform or tofu binary on the PATH.
+//
+//go:generate go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs generate --provider-name prepaidhost --rendered-provider-name "Prepaid-Host"
+
 // version is set by goreleaser (https://goreleaser.com/cookbooks/using-main.version/).
 var version = "dev"
 
