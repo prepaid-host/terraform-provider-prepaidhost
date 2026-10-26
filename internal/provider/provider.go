@@ -139,7 +139,9 @@ func (p *PrepaidHostProvider) Configure(ctx context.Context, req provider.Config
 
 // Resources lists the managed resource types.
 func (p *PrepaidHostProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{}
+	return []func() resource.Resource{
+		NewSSHKeyResource,
+	}
 }
 
 // DataSources lists the data sources.

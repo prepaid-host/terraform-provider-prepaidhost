@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -375,3 +376,5 @@ func TestSetOrderItemStatus(t *testing.T) {
 		t.Errorf("result=%s", env.Result)
 	}
 }
+
+func itoa(n int64) string { return strconv.FormatInt(n, 10) }
