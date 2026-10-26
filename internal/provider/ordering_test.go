@@ -223,8 +223,10 @@ func TestOrderResource_LostResponseIsReplayed(t *testing.T) {
 
 	id, outcome, diags := orderResource(context.Background(), c, serverItem(), "web1", nil, orderTestTimeout, orderOptions{})
 	requireNoErrors(t, diags)
-	if outcome != orderNew {
-		t.Errorf("outcome = %v: this call's own order (lost response) is new, not a pre-existing resource", outcome)
+	// This call's own order, but its replay lies within replayTolerance of
+	// the start, so it counts as placed before (harmless, see placedBefore).
+	if outcome != orderReplayed {
+		t.Errorf("outcome = %v, want replayed (within the clock tolerance)", outcome)
 	}
 	if ids := api.ResourceIDs(testapi.ResourceRootserver); len(ids) != 1 || ids[0] != id {
 		t.Fatalf("id = %d, resources = %v", id, ids)
@@ -273,8 +275,10 @@ func TestOrderResource_SlowOrderIsWaitedFor(t *testing.T) {
 
 	id, outcome, diags := orderResource(context.Background(), c, serverItem(), "web1", nil, orderTestTimeout, orderOptions{})
 	requireNoErrors(t, diags)
-	if outcome != orderNew {
-		t.Errorf("outcome = %v: this call's own order (lost response) is new, not a pre-existing resource", outcome)
+	// This call's own order, but its replay lies within replayTolerance of
+	// the start, so it counts as placed before (harmless, see placedBefore).
+	if outcome != orderReplayed {
+		t.Errorf("outcome = %v, want replayed (within the clock tolerance)", outcome)
 	}
 	if ids := api.ResourceIDs(testapi.ResourceRootserver); len(ids) != 1 || ids[0] != id {
 		t.Fatalf("id = %d, resources = %v", id, ids)
@@ -956,6 +960,64 @@ func TestOrderOutcome_String(t *testing.T) {
 	for o, want := range map[orderOutcome]string{orderNew: "new", orderReplayed: "replayed", orderReferenceInUse: "reference in use"} {
 		if o.String() != want {
 			t.Errorf("%d: %q", o, o.String())
+		}
+	}
+}
+
+// Task 6 follow-up: the term of a rootserver ends after the months
+// RootserverFulfiller maps duration_days to (30→1, 90→3, 180→6, 365→12),
+// added as calendar months like Carbon::addMonths.
+func TestTermOver_RootserverDaysAreMonths(t *testing.T) {
+	at := func(s string) time.Time {
+		v, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	cases := []struct {
+		created, now string
+		days         int
+		want         bool
+	}{
+		// 90 days end on Aug 30, 3 months on Sep 1.
+		{"2026-06-01T00:00:00Z", "2026-08-31T12:00:00Z", 90, false},
+		{"2026-06-01T00:00:00Z", "2026-09-01T00:00:01Z", 90, true},
+		// 2028 is a leap year: 365 days end on Dec 31, 12 months on Jan 1.
+		{"2028-01-01T00:00:00Z", "2028-12-31T12:00:00Z", 365, false},
+		{"2028-01-01T00:00:00Z", "2029-01-01T00:00:01Z", 365, true},
+		{"2026-06-01T00:00:00Z", "2026-07-01T00:00:01Z", 30, true},
+		{"2026-06-01T00:00:00Z", "2026-11-30T23:00:00Z", 180, false},
+		{"2026-06-01T00:00:00Z", "2026-12-01T00:00:01Z", 180, true},
+	}
+	for _, tc := range cases {
+		order := &client.Order{CreatedAt: tc.created}
+		item := map[string]any{"type": "rootserver", "duration_days": tc.days}
+		if got := termOver(order, item, at(tc.now)); got != tc.want {
+			t.Errorf("created %s, %d days, now %s: termOver = %v, want %v", tc.created, tc.days, tc.now, got, tc.want)
+		}
+	}
+}
+
+// Task 6 follow-up: a replay counts as an earlier order unless it is clearly
+// younger than this call (created_at at least replayTolerance after the
+// start). A server clock running ahead must not hide an earlier order —
+// wrongly "replayed" only re-enables auto-renew once more, wrongly "new"
+// would leave it off after destroy.
+func TestPlacedBefore_ToleratesClockSkew(t *testing.T) {
+	start := time.Now()
+	cases := map[string]struct {
+		created string
+		want    bool
+	}{
+		"an hour before":           {start.Add(-time.Hour).UTC().Format(time.RFC3339), true},
+		"server clock 1 min ahead": {start.Add(time.Minute).UTC().Format(time.RFC3339), true},
+		"well after the start":     {start.Add(replayTolerance + time.Minute).UTC().Format(time.RFC3339), false},
+		"unreadable":               {"yesterday", true},
+	}
+	for name, tc := range cases {
+		if got := placedBefore(&client.Order{CreatedAt: tc.created}, start); got != tc.want {
+			t.Errorf("%s: placedBefore = %v, want %v", name, got, tc.want)
 		}
 	}
 }

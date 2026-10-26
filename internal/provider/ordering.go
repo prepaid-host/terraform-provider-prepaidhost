@@ -42,9 +42,22 @@ const (
 	maxInProgressWait  = 30 * time.Second
 	maxClientReference = 64
 	// maxKeyChain bounds the follow-up keys used to buy again after the terms
-	// of earlier orders under this configuration ran out.
+	// of earlier orders under this configuration ran out. At the end of the
+	// chain the engine stops with an error rather than trying one more key:
+	// whether that key would replay, meet a live server (take-over) or buy
+	// can only be learnt by sending it, so "one more" would just be a longer
+	// chain. Eleven purchases of one configuration under one client
+	// reference are far beyond normal use; the error names the way out
+	// (another hostname/name).
 	maxKeyChain = 10
+	// replayTolerance is how much younger than this call a replayed order may
+	// look and still count as placed before it (see placedBefore).
+	replayTolerance = 2 * time.Minute
 )
+
+// rootserverMonths maps a rootserver's duration_days to the months of its
+// rental, like RootserverFulfiller.
+var rootserverMonths = map[int]int{30: 1, 90: 3, 180: 6, 365: 12}
 
 // orderResourceTypes maps an order item type to the resource type the API
 // creates for it (OrderItem.resource_type).
@@ -88,8 +101,9 @@ type orderOptions struct {
 type orderOutcome int
 
 const (
-	// orderNew: bought by this call (including a replay of this call's own
-	// order whose response was lost and retried).
+	// orderNew: bought by this call. A replay of this call's own order whose
+	// response was lost usually counts as orderReplayed instead (see
+	// placedBefore) — harmless for the caller.
 	orderNew orderOutcome = iota
 	// orderReplayed: an order placed before this call with the same
 	// configuration (an aborted apply, or apply after destroy) was replayed;
@@ -294,43 +308,50 @@ func addPlaceOrderError(ctx context.Context, diags *diag.Diagnostics, err error,
 }
 
 // termOver reports whether the term of a replayed order has ended:
-// created_at + the item's duration (rootserver: duration_days days, default
-// 30; rootpacket and domain: duration_months months, default 1) lies before
-// now. An unreadable created_at counts as "not over": the engine then never
-// buys again.
+// created_at + the item's duration in calendar months lies before now. The
+// months are what the API rents: rootpacket and domain duration_months
+// (default 1); rootserver duration_days mapped like RootserverFulfiller
+// (30→1, 90→3, 180→6, 365→12, otherwise days/30 rounded, at least 1; default
+// 1), added like Carbon::addMonths. An unreadable created_at counts as "not
+// over": the engine then never buys again.
 func termOver(order *client.Order, item map[string]any, now time.Time) bool {
 	created, err := time.Parse(time.RFC3339, order.CreatedAt)
 	if err != nil {
 		return false
 	}
-	var end time.Time
+	months := 1
 	if itemType, _ := item["type"].(string); itemType == "rootserver" {
-		days, ok := number(item["duration_days"])
-		if !ok || days < 1 {
-			days = 30
+		if days, ok := number(item["duration_days"]); ok && days >= 1 {
+			if m, known := rootserverMonths[int(days)]; known && float64(int(days)) == days {
+				months = m
+			} else {
+				months = max(1, int(math.Round(days/30)))
+			}
 		}
-		end = created.AddDate(0, 0, int(days))
-	} else {
-		months, ok := number(item["duration_months"])
-		if !ok || months < 1 {
-			months = 1
-		}
-		end = created.AddDate(0, int(months), 0)
+	} else if m, ok := number(item["duration_months"]); ok && m >= 1 {
+		months = int(m)
 	}
-	return end.Before(now)
+	return created.AddDate(0, months, 0).Before(now)
 }
 
-// placedBefore reports whether the order was created before this call
-// started. created_at has second precision, so this call's own order (lost
-// response, retried) is never older than the second the call started in. An
-// unreadable created_at counts as earlier (auto-renew is then switched on,
-// which is harmless).
+// placedBefore reports whether a replayed order was placed before this call
+// started, i.e. the resource existed before (an aborted apply, or apply after
+// destroy) rather than this call's own order whose response was lost.
+//
+// created_at comes from the server clock, start from the local one. The
+// comparison leans towards "before" by replayTolerance, because the two
+// mistakes are not equal: a wrong "before" only switches auto-renew on once
+// more (it already is on) and shows the neutral take-over warning; a wrong
+// "not before" would leave auto-renew off after destroy + apply when the
+// server clock runs ahead. The price: this call's own order replayed after a
+// lost response usually counts as "before" too. An unreadable created_at
+// counts as before as well.
 func placedBefore(order *client.Order, start time.Time) bool {
 	created, err := time.Parse(time.RFC3339, order.CreatedAt)
 	if err != nil {
 		return true
 	}
-	return created.Before(start.Truncate(time.Second))
+	return created.Before(start.Add(replayTolerance))
 }
 
 func number(v any) (float64, bool) {
