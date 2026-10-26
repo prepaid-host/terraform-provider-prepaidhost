@@ -303,3 +303,26 @@ func TestPollIntervalDefault(t *testing.T) {
 		t.Errorf("PollInterval = %v, want 10s", got)
 	}
 }
+
+func TestListOrdersNewestFirstAndPaged(t *testing.T) {
+	api := testapi.New(t)
+	for _, ref := range []string{"a.de", "b.de", "c.de"} {
+		api.SeedOrder("domain", testapi.ResourceDomain, api.SeedDomain(map[string]any{"client_reference": ref}), ref, "active")
+	}
+	c := newTestClient(api)
+
+	page1, err := c.ListOrders(context.Background(), 1, 2)
+	if err != nil {
+		t.Fatalf("ListOrders: %v", err)
+	}
+	if len(page1) != 2 || page1[0].Items[0].ClientReference != "c.de" || page1[1].Items[0].ClientReference != "b.de" {
+		t.Errorf("page 1 = %+v", page1)
+	}
+	page2, err := c.ListOrders(context.Background(), 2, 2)
+	if err != nil || len(page2) != 1 || page2[0].Items[0].ClientReference != "a.de" || page2[0].Items[0].Status != client.StatusActive {
+		t.Errorf("page 2 = %+v, %v", page2, err)
+	}
+	if page3, err := c.ListOrders(context.Background(), 3, 2); err != nil || len(page3) != 0 {
+		t.Errorf("page 3 = %+v, %v", page3, err)
+	}
+}

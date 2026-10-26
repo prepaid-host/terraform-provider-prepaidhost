@@ -13,9 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	tfresource "github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
@@ -807,5 +809,156 @@ func TestDomain_PurchaseArgumentsAfterImportAreTaken(t *testing.T) {
 	plan["duration_months"] = num(24)
 	if resp := domainModifyPlan(t, state, plan); resp.Diagnostics.HasError() {
 		t.Errorf("errors: %v", resp.Diagnostics)
+	}
+}
+
+// ---- follow-ups: local nameservers on create, unfinished orders on adoption ----
+
+func (d domainTest) createDirect(t *testing.T, set map[string]tftypes.Value) resource.CreateResponse {
+	t.Helper()
+	sch := domainSchema(t)
+	vals := d.values()
+	for k, v := range set {
+		vals[k] = v
+	}
+	req := resource.CreateRequest{
+		Plan:   tfsdk.Plan{Schema: sch.Schema, Raw: tfValue(t, sch, vals, false)},
+		Config: tfsdk.Config{Schema: sch.Schema, Raw: tfValue(t, sch, vals, true)},
+	}
+	resp := resource.CreateResponse{State: tfsdk.State{Schema: sch.Schema, Raw: tftypes.NewValue(sch.Schema.Type().TerraformType(context.Background()), nil)}}
+	d.resource().Create(context.Background(), req, &resp)
+	return resp
+}
+
+func createdNameservers(t *testing.T, resp resource.CreateResponse) types.List {
+	t.Helper()
+	var ns types.List
+	resp.State.GetAttribute(context.Background(), path.Root("nameservers"), &ns)
+	return ns
+}
+
+func hasWarning(diags diag.Diagnostics, summary string) bool {
+	for _, w := range diags.Warnings() {
+		if w.Summary() == summary {
+			return true
+		}
+	}
+	return false
+}
+
+// The registrar does not answer (source "local") and no nameservers are
+// configured: nothing is sent, the local ns1/ns2 are not stored, a warning says so.
+func TestDomain_CreateLocalNameserversStayNull(t *testing.T) {
+	d := newDomainTest(t)
+	d.api.SetProvisioner("domain", func(_, attrs map[string]any) { attrs["nameserver_source"] = "local" })
+	resp := d.createDirect(t, nil)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("create: %v", resp.Diagnostics)
+	}
+	if ns := createdNameservers(t, resp); !ns.IsNull() {
+		t.Errorf("nameservers = %v, want null", ns)
+	}
+	if !hasWarning(resp.Diagnostics, "Nameservers not readable from the registrar") {
+		t.Errorf("want the registrar warning, got %v", resp.Diagnostics)
+	}
+	if n := d.api.CallCount(http.MethodPut, "/domain/{id}/nameservers"); n != 0 {
+		t.Errorf("PUT nameservers = %d, want 0", n)
+	}
+}
+
+// Configured nameservers are not sent while the registrar cannot be read.
+func TestDomain_CreateLocalNameserversConfiguredAreNotSent(t *testing.T) {
+	d := newDomainTest(t)
+	d.api.SetProvisioner("domain", func(_, attrs map[string]any) { attrs["nameserver_source"] = "local" })
+	resp := d.createDirect(t, map[string]tftypes.Value{
+		"nameservers": tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, []tftypes.Value{str("a.example.net"), str("b.example.net")}),
+	})
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("create: %v", resp.Diagnostics)
+	}
+	var ns []string
+	resp.State.GetAttribute(context.Background(), path.Root("nameservers"), &ns)
+	if fmt.Sprint(ns) != "[a.example.net b.example.net]" {
+		t.Errorf("nameservers = %v, want the configured list", ns)
+	}
+	if !hasWarning(resp.Diagnostics, "Nameservers not applied yet") {
+		t.Errorf("want the not-applied warning, got %v", resp.Diagnostics)
+	}
+	if n := d.api.CallCount(http.MethodPut, "/domain/{id}/nameservers"); n != 0 {
+		t.Errorf("PUT nameservers = %d, want 0", n)
+	}
+}
+
+// A domain taken over by its reference whose earlier order is still
+// provisioning is paid but not active: status says so and a warning appears.
+func TestDomain_AdoptionOfUnfinishedOrderIsProvisioning(t *testing.T) {
+	d := newDomainTest(t)
+	existing := d.api.SeedDomain(map[string]any{"client_reference": "example.de"})
+	d.api.SeedOrder("domain", testapi.ResourceDomain, existing, "example.de", "provisioning")
+	resp := d.createDirect(t, nil)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("create: %v", resp.Diagnostics)
+	}
+	var status types.String
+	resp.State.GetAttribute(context.Background(), path.Root("status"), &status)
+	if status.ValueString() != "provisioning" {
+		t.Errorf("status = %q, want provisioning", status.ValueString())
+	}
+	if !hasWarning(resp.Diagnostics, "Domain paid but not yet active") || !hasWarning(resp.Diagnostics, "Existing domain taken over") {
+		t.Errorf("want both warnings, got %v", resp.Diagnostics)
+	}
+}
+
+// An adopted domain with an active order item (and one from the panel, which
+// has no order at all) stays active and gets no extra warning.
+func TestDomain_AdoptionOfActiveOrderStaysActive(t *testing.T) {
+	for name, withOrder := range map[string]bool{"active item": true, "no order": false} {
+		t.Run(name, func(t *testing.T) {
+			d := newDomainTest(t)
+			existing := d.api.SeedDomain(map[string]any{"client_reference": "example.de"})
+			if withOrder {
+				d.api.SeedOrder("domain", testapi.ResourceDomain, existing, "example.de", "active")
+			}
+			resp := d.createDirect(t, nil)
+			if resp.Diagnostics.HasError() {
+				t.Fatalf("create: %v", resp.Diagnostics)
+			}
+			var status types.String
+			resp.State.GetAttribute(context.Background(), path.Root("status"), &status)
+			if status.ValueString() != "active" || hasWarning(resp.Diagnostics, "Domain paid but not yet active") {
+				t.Errorf("status = %q, diags = %v", status.ValueString(), resp.Diagnostics)
+			}
+		})
+	}
+}
+
+// Read keeps "provisioning" while the order item is not active, and moves on
+// once it is.
+func TestDomain_ReadKeepsProvisioningUntilActive(t *testing.T) {
+	d := newDomainTest(t)
+	id := d.api.SeedDomain(map[string]any{"client_reference": "example.de"})
+	orderID := d.api.SeedOrder("domain", testapi.ResourceDomain, id, "example.de", "provisioning")
+
+	read := func() resource.ReadResponse {
+		sch := domainSchema(t)
+		vals := d.values()
+		vals["id"] = str(strconv.FormatInt(id, 10))
+		vals["status"] = str("provisioning")
+		state := tfsdk.State{Schema: sch.Schema, Raw: tfValue(t, sch, vals, true)}
+		resp := resource.ReadResponse{State: state}
+		d.resource().Read(context.Background(), resource.ReadRequest{State: state}, &resp)
+		return resp
+	}
+	resp := read()
+	if got := stateString(t, resp, "status"); got != "provisioning" || !hasWarning(resp.Diagnostics, "Domain paid but not yet active") {
+		t.Errorf("status = %q, diags = %v", got, resp.Diagnostics)
+	}
+	d.api.SetOrderItemStatus(orderID, 0, "active")
+	resp = read()
+	if got := stateString(t, resp, "status"); got != "active" || hasWarning(resp.Diagnostics, "Domain paid but not yet active") {
+		t.Errorf("status = %q, diags = %v", got, resp.Diagnostics)
+	}
+	if stateString(t, resp, "expires_at") == "" {
+		t.Errorf("expires_at must be read together with the status")
 	}
 }

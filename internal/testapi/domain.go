@@ -92,6 +92,11 @@ func (st *State) validateDomainItem(index int, it map[string]any) *Response {
 		resp := invalidField(fmt.Sprintf("items.%d.%s", index, key), message)
 		return &resp
 	}
+	// A transfer is refused before any other rule (the server checks the
+	// action first): nothing else of the item matters then.
+	if a, _ := it["action"].(string); a == "transfer" {
+		return invalid("action", "Domain-Transfers sind per API noch nicht möglich – bitte im Kundenpanel durchführen.")
+	}
 	sld, _ := it["sld"].(string)
 	if sld == "" || len(sld) > 63 {
 		return invalid("sld", "The sld field is required.")
@@ -104,12 +109,7 @@ func (st *State) validateDomainItem(index int, it map[string]any) *Response {
 		return invalid("duration_months", "The selected duration months is invalid.")
 	}
 	if v, ok := it["action"]; ok && v != nil {
-		switch a, _ := v.(string); a {
-		case "register":
-		case "transfer":
-			// The API does not execute transfers (yet): refused before anything is charged.
-			return invalid("action", "Domain-Transfers sind über die API nicht verfügbar. Bitte im Kundenbereich beauftragen.")
-		default:
+		if a, _ := v.(string); a != "register" {
 			return invalid("action", "The selected action is invalid.")
 		}
 	}

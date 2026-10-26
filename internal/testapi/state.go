@@ -84,6 +84,7 @@ type Order struct {
 	Total       float64
 	CreatedAt   string
 	Items       []*OrderItem
+	seq         int
 	pollsLeft   int
 	outcome     string
 	requestHash string

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +22,7 @@ func init() {
 	register(func(s *Server) {
 		s.Handle(http.MethodPost, "/orders/quote", handleQuote)
 		s.Handle(http.MethodPost, "/orders", handlePlaceOrder)
+		s.Handle(http.MethodGet, "/orders", handleListOrders)
 		s.Handle(http.MethodGet, "/orders/{uuid}", handleGetOrder)
 		s.Handle(http.MethodGet, "/account/balance", handleBalance)
 	})
@@ -284,6 +287,7 @@ func handlePlaceOrder(st *State, r *Request) Response {
 	st.nextOrder++
 	order := &Order{
 		ID:          fmt.Sprintf("00000000-0000-4000-8000-%012d", st.nextOrder),
+		seq:         st.nextOrder,
 		Total:       p.total,
 		CreatedAt:   nowRFC3339(),
 		pollsLeft:   st.ProvisionPolls,
@@ -394,6 +398,50 @@ func handleGetOrder(st *State, r *Request) Response {
 		return Fail(http.StatusNotFound, "ORDER_NOT_FOUND", "Bestellung nicht gefunden.", nil)
 	}
 	return OK(o.present(st, true))
+}
+
+// handleListOrders is OrderController::index: the account's orders, newest
+// first, paginated (page, per_page up to 100). Listing does not advance the
+// simulated provisioning.
+func handleListOrders(st *State, r *Request) Response {
+	perPage, page := 15, 1
+	if v, err := strconv.Atoi(r.URL.Query().Get("per_page")); err == nil {
+		perPage = min(100, max(1, v))
+	}
+	if v, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && v > 0 {
+		page = v
+	}
+	orders := make([]*Order, 0, len(st.Orders))
+	for _, o := range st.Orders {
+		orders = append(orders, o)
+	}
+	sort.Slice(orders, func(i, j int) bool { return orders[i].seq > orders[j].seq })
+	from := min((page-1)*perPage, len(orders))
+	to := min(from+perPage, len(orders))
+	result := make([]map[string]any, 0, to-from)
+	for _, o := range orders[from:to] {
+		result = append(result, o.present(st, false))
+	}
+	return Response{Status: http.StatusOK, Body: map[string]any{
+		"success": true, "result": result,
+		"meta": map[string]any{"page": page, "per_page": perPage, "total": len(orders)},
+	}}
+}
+
+// SeedOrder adds a completed order with one item for an existing resource,
+// e.g. the earlier API order of a live domain; status is the item's status
+// (active, provisioning or failed). It returns the order id.
+func (s *Server) SeedOrder(itemType, resourceType string, resourceID int64, reference, status string) string {
+	var id string
+	s.With(func(st *State) {
+		st.nextOrder++
+		id = fmt.Sprintf("00000000-0000-4000-8000-%012d", st.nextOrder)
+		st.Orders[id] = &Order{
+			ID: id, seq: st.nextOrder, CreatedAt: nowRFC3339(), outcome: "active",
+			Items: []*OrderItem{{Type: itemType, ResourceType: resourceType, ResourceID: resourceID, ClientReference: &reference, ForcedStatus: status}},
+		}
+	})
+	return id
 }
 
 func handleBalance(st *State, _ *Request) Response {

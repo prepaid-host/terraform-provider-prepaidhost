@@ -234,7 +234,7 @@ func (r *domainResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Validators: []validator.String{durationValidator{}},
 			},
 			"status": schema.StringAttribute{
-				MarkdownDescription: "`active`, or `expired` when the term ran out.",
+				MarkdownDescription: "`active`; `expired` when the term ran out; `provisioning` while a taken-over domain's earlier order is not active yet (the registration is not finished).",
 				Computed:            true,
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
@@ -483,18 +483,48 @@ func (r *domainResource) Create(ctx context.Context, req resource.CreateRequest,
 				"Auto-renew is %s.", id, name, onOff(wantRenew)))
 	}
 
-	current, _, err := r.nameservers(pctx, id)
+	// A domain taken over by its reference may come from an order that is not
+	// finished: paid, but not active yet.
+	pendingStatus := ""
+	if outcome == orderReferenceInUse {
+		if pendingStatus = pendingItemStatus(pctx, r.client, "domain", resourceID); pendingStatus != "" {
+			resp.Diagnostics.AddWarning("Domain paid but not yet active",
+				fmt.Sprintf("The order item of domain %s (%s) has the status %q, not \"active\": the domain is paid but not yet "+
+					"registered. The status stays %q until a refresh sees it active — contact support if it stays so.",
+					id, name, pendingStatus, pendingStatus))
+		}
+	}
+
+	current, local, err := r.nameservers(pctx, id)
 	if err != nil {
 		paidError("Could not read the nameservers", "its nameservers could not be read", describeError(err))
 		return
 	}
-	if !plan.Nameservers.IsUnknown() && !plan.Nameservers.IsNull() && !plan.Nameservers.Equal(current) {
+	configured := !plan.Nameservers.IsUnknown() && !plan.Nameservers.IsNull()
+	switch {
+	case local:
+		// The registrar did not answer: the API only has its local copy of
+		// ns1/ns2, which neither tells what is set nor deserves a write.
+		if configured {
+			resp.Diagnostics.AddWarning("Nameservers not applied yet",
+				fmt.Sprintf("The registrar did not answer for domain %s, so the configured nameservers were neither read nor "+
+					"sent. They are stored as configured; the next apply or refresh compares them with the registrar and sets "+
+					"them if they differ.", id))
+		} else {
+			resp.Diagnostics.AddWarning("Nameservers not readable from the registrar",
+				fmt.Sprintf("The registrar did not answer for domain %s; nameservers stay unset in the state until a refresh "+
+					"can read them.", id))
+			plan.Nameservers = types.ListNull(types.StringType)
+		}
+	case configured && !plan.Nameservers.Equal(current):
 		if current, err = r.setNameservers(pctx, id, plan.Nameservers); err != nil {
 			paidError("Could not set the nameservers", "its nameservers could not be set", nameserverErrorDetail(err))
 			return
 		}
+		plan.Nameservers = current
+	default:
+		plan.Nameservers = current
 	}
-	plan.Nameservers = current
 
 	exp, _, err := r.term(pctx, id)
 	if err != nil {
@@ -503,6 +533,9 @@ func (r *domainResource) Create(ctx context.Context, req resource.CreateRequest,
 	}
 	plan.ID = types.StringValue(id)
 	plan.setTerm(exp)
+	if pendingStatus != "" {
+		plan.Status = types.StringValue(pendingStatus)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -513,6 +546,7 @@ func (r *domainResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 	id := state.ID.ValueString()
+	previousStatus := state.Status.ValueString()
 
 	gone := func() {
 		resp.Diagnostics.AddWarning("Domain no longer exists",
@@ -552,6 +586,16 @@ func (r *domainResource) Read(ctx context.Context, req resource.ReadRequest, res
 		}
 		if state.Status.IsNull() || state.Status.IsUnknown() {
 			state.Status = types.StringValue(statusActive)
+		}
+	}
+	if previousStatus == statusProvisioning || previousStatus == client.StatusFailed {
+		// Taken over while its order was not active: keep saying so until it is.
+		if rid, perr := strconv.ParseInt(id, 10, 64); perr == nil {
+			if pending := pendingItemStatus(ctx, r.client, "domain", rid); pending != "" {
+				state.Status = types.StringValue(pending)
+				resp.Diagnostics.AddWarning("Domain paid but not yet active",
+					fmt.Sprintf("The order item of domain %s (%s) still has the status %q — contact support if it stays so.", id, name, pending))
+			}
 		}
 	}
 	if err == nil && exp != nil && exp.Before(time.Now()) {

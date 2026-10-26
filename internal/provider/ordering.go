@@ -641,3 +641,44 @@ func canonicalNumber(n json.Number) string {
 	}
 	return strconv.FormatFloat(f, 'g', -1, 64)
 }
+
+// Bounds of the order lookup of itemStatus: newest orders first, so the order
+// that created a recent resource is found on the first page.
+const (
+	orderListPerPage = 100
+	orderListPages   = 5
+)
+
+// itemStatus returns the status of the order item that created the resource
+// (GET /orders: items carry resource_id and client_reference). found is false
+// when no order of this account names the resource — one ordered in the panel
+// — or the lookup failed; the caller then has nothing to say about it.
+func itemStatus(ctx context.Context, c *client.Client, resourceType string, resourceID int64) (status string, found bool) {
+	for page := 1; page <= orderListPages; page++ {
+		orders, err := c.ListOrders(ctx, page, orderListPerPage)
+		if err != nil || len(orders) == 0 {
+			return "", false
+		}
+		for _, o := range orders {
+			for _, it := range o.Items {
+				if it.ResourceType == resourceType && it.ResourceID == resourceID {
+					return it.Status, true
+				}
+			}
+		}
+		if len(orders) < orderListPerPage {
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// pendingItemStatus is itemStatus for a resource that must be active: it
+// returns the item's status when that is not active yet (provisioning,
+// failed), and "" when the resource is active or unknown to the orders.
+func pendingItemStatus(ctx context.Context, c *client.Client, resourceType string, resourceID int64) string {
+	if status, found := itemStatus(ctx, c, resourceType, resourceID); found && status != client.StatusActive {
+		return status
+	}
+	return ""
+}

@@ -52,7 +52,9 @@ type vserverResource struct {
 const (
 	statusActive     = "active"
 	statusInstalling = "installing"
-	statusExpired    = "expired"
+	// statusProvisioning: the order item of a taken-over domain is not active yet.
+	statusProvisioning = "provisioning"
+	statusExpired      = "expired"
 	// minPostPurchase is the time the reads after a paid order get at least,
 	// even when create_timeout is (nearly) used up.
 	minPostPurchase = 30 * time.Second

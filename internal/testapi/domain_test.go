@@ -307,3 +307,15 @@ func TestDNSRecords(t *testing.T) {
 		t.Errorf("unknown domain: %d %v", resp.StatusCode, env.Error)
 	}
 }
+
+// A transfer is refused first: even an item that breaks every other rule gets
+// the transfer message, not a duration, contact or TLD error.
+func TestDomainTransferRefusedBeforeOtherValidation(t *testing.T) {
+	api := testapi.New(t)
+	it := map[string]any{"type": "domain", "sld": "", "tld": "xyz", "duration_months": 6, "action": "transfer"}
+	status, e := quoteError(t, api, it)
+	const want = "Domain-Transfers sind per API noch nicht möglich – bitte im Kundenpanel durchführen."
+	if status != http.StatusUnprocessableEntity || e["code"] != "VALIDATION_FAILED" || e["field"] != "items.0.action" || e["message"] != want {
+		t.Errorf("status=%d error=%v", status, e)
+	}
+}

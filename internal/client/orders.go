@@ -115,6 +115,18 @@ func (c *Client) GetOrder(ctx context.Context, uuid string) (*Order, error) {
 	return &o, nil
 }
 
+// ListOrders returns one page of the account's orders, newest first
+// (GET /orders). perPage is capped by the API at 100; a page without orders
+// is the end of the list.
+func (c *Client) ListOrders(ctx context.Context, page, perPage int) ([]Order, error) {
+	var orders []Order
+	path := fmt.Sprintf("/orders?page=%d&per_page=%d", max(page, 1), max(perPage, 1))
+	if err := c.Do(ctx, http.MethodGet, path, nil, &orders, nil); err != nil {
+		return nil, err
+	}
+	return orders, nil
+}
+
 // WaitForItem polls GET /orders/{uuid} every poll interval until item index
 // is active. It returns ErrItemFailed (with the item) when the item failed,
 // and the context's error (with the last seen item) on cancellation or
