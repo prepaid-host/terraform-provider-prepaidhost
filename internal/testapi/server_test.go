@@ -444,3 +444,31 @@ func TestPlaceOrder_FingerprintIsNormalised(t *testing.T) {
 		t.Fatalf("other total: status=%d env=%+v", resp.StatusCode, env)
 	}
 }
+
+func TestSetOrderCreatedAtBackdatesOrderAndReplay(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	body := map[string]any{"items": []any{item("web1")}, "expected_total": 9.99}
+	key := map[string]string{"Idempotency-Key": "key-backdate-1"}
+	if resp, _ := call(t, api, http.MethodPost, "/orders", api.Token, body, key); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	ids := api.OrderIDs()
+	if len(ids) != 1 {
+		t.Fatalf("orders = %v", ids)
+	}
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	api.SetOrderCreatedAt(ids[0], at)
+
+	var order struct {
+		CreatedAt string `json:"created_at"`
+	}
+	_, env := call(t, api, http.MethodPost, "/orders", api.Token, body, key)
+	if err := json.Unmarshal(env.Result, &order); err != nil || order.CreatedAt != "2026-01-02T03:04:05Z" {
+		t.Errorf("replay created_at = %q (%v)", order.CreatedAt, err)
+	}
+	_, env = call(t, api, http.MethodGet, "/orders/"+ids[0], api.Token, nil, nil)
+	if err := json.Unmarshal(env.Result, &order); err != nil || order.CreatedAt != "2026-01-02T03:04:05Z" {
+		t.Errorf("GET created_at = %q (%v)", order.CreatedAt, err)
+	}
+}

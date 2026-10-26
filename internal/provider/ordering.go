@@ -41,6 +41,9 @@ const (
 	// still processing an earlier request with the same key.
 	maxInProgressWait  = 30 * time.Second
 	maxClientReference = 64
+	// maxKeyChain bounds the follow-up keys used to buy again after the terms
+	// of earlier orders under this configuration ran out.
+	maxKeyChain = 10
 )
 
 // orderResourceTypes maps an order item type to the resource type the API
@@ -52,7 +55,8 @@ var orderResourceTypes = map[string]string{
 }
 
 // purchaseFields are the item fields that decide what is bought and what it
-// costs — the material of the Idempotency-Key. It is an allowlist on purpose:
+// costs — the material of the Idempotency-Key. It is an allowlist of fields
+// the API actually evaluates (OrderPlacementService::INPUT_KEYS), on purpose:
 //
 //   - Secrets stay out (password, authcode): the key is a plain SHA-256 sent to
 //     the API in a header, and a hash of a password plus guessable fields could
@@ -61,14 +65,50 @@ var orderResourceTypes = map[string]string{
 //   - Fields that change neither product nor price stay out (ssh_key_ids,
 //     hostname, contact_id): changing them must not turn a repeated apply into
 //     a new purchase.
-//   - promo_code is in: it changes the price.
+//   - rootpacket's item promo_code (a packet promotion keyword) is in: it
+//     changes the price. The order-level promo code is added separately
+//     (orderOptions.PromoCode).
 //
 // A field missing here can never cause a double purchase: the same key with a
-// different body is answered with IDEMPOTENCY_CONFLICT, which is an error.
+// different body is answered with IDEMPOTENCY_CONFLICT.
 var purchaseFields = map[string][]string{
-	"rootserver": {"cores", "memory", "disk", "addresses", "backups", "traffic", "duration_days", "duration_months", "template_id", "promo_code"},
-	"rootpacket": {"packet_id", "duration_months", "duration_days", "template_id", "promo_code"},
-	"domain":     {"sld", "tld", "name", "duration_months", "action", "promo_code"},
+	"rootserver": {"cores", "memory", "disk", "addresses", "backups", "traffic", "duration_days", "template_id"},
+	"rootpacket": {"packet_id", "duration_months", "template_id", "promo_code"},
+	"domain":     {"sld", "tld", "duration_months", "action"},
+}
+
+// orderOptions are the optional order-level settings.
+type orderOptions struct {
+	// PromoCode is the order's promo code (trimmed; "" = none). It changes the
+	// price and is therefore part of the Idempotency-Key.
+	PromoCode string
+}
+
+// orderOutcome says where the resource returned by orderResource comes from.
+type orderOutcome int
+
+const (
+	// orderNew: bought by this call (including a replay of this call's own
+	// order whose response was lost and retried).
+	orderNew orderOutcome = iota
+	// orderReplayed: an order placed before this call with the same
+	// configuration (an aborted apply, or apply after destroy) was replayed;
+	// nothing was charged now. Its resource may have auto-renew switched off.
+	orderReplayed
+	// orderReferenceInUse: a live resource with the same client reference
+	// already existed (CLIENT_REFERENCE_IN_USE) and is taken over; nothing
+	// was charged.
+	orderReferenceInUse
+)
+
+func (o orderOutcome) String() string {
+	switch o {
+	case orderReplayed:
+		return "replayed"
+	case orderReferenceInUse:
+		return "reference in use"
+	}
+	return "new"
 }
 
 // orderResource buys one item and waits until it is provisioned.
@@ -79,34 +119,45 @@ var purchaseFields = map[string][]string{
 // caller accepts — a higher quote is an error before anything is ordered.
 // timeout bounds the whole call (default 30 minutes when <= 0).
 //
-// adopted is true when the resource was not bought by this call: either the
-// API named a live resource with the same client reference
-// (CLIENT_REFERENCE_IN_USE), or it replayed an order placed earlier with the
-// same Idempotency-Key (an aborted apply, or apply after destroy). The caller
-// then switches auto-renew on again and warns that an existing resource was
-// adopted. A replay can also be this call's own order whose response was lost
-// and retried; adopting it is harmless.
+// outcome tells the caller how to go on: for orderReplayed and
+// orderReferenceInUse the resource existed before this call, so the caller
+// switches auto-renew on again (destroy switched it off) and warns that an
+// existing resource was taken over; orderNew needs neither.
+//
+// Keys: the first attempt uses idempotencyKey. Two cases move on to a
+// deterministic follow-up key, so a repeated apply walks the same path:
+//   - The key replays an order whose term is over (created_at + duration in
+//     the past): chainKey(key, order id), up to maxKeyChain links.
+//   - The key answers IDEMPOTENCY_CONFLICT (same configuration ordered with
+//     other details, e.g. a changed password or price): conflictKey, once.
+//
+// Neither buys twice: the API refuses a new order while a live resource
+// carries the client reference (checked under the user lock, before the
+// balance) and names it instead — the engine then takes it over. A replay
+// within the term is never bought again, even when its item failed.
 //
 // On error resourceID is 0, except when the order was paid but the item
 // failed or did not become active in time: then it names the resource. The
-// caller must not save state in that case — the next apply sends the same key
-// and gets the same order back.
-func orderResource(ctx context.Context, c *client.Client, item map[string]any, clientReference string, maxPrice *float64, timeout time.Duration) (resourceID int64, adopted bool, diags diag.Diagnostics) {
+// caller must not save state in that case — the next apply walks the same
+// keys and gets the same order back.
+func orderResource(ctx context.Context, c *client.Client, item map[string]any, clientReference string, maxPrice *float64, timeout time.Duration, opts orderOptions) (resourceID int64, outcome orderOutcome, diags diag.Diagnostics) {
+	start := time.Now()
 	itemType, _ := item["type"].(string)
 	wantResourceType, ok := orderResourceTypes[itemType]
 	if !ok {
 		diags.AddError("Unsupported order type", fmt.Sprintf("Cannot order an item of type %q (provider bug).", itemType))
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
 	if clientReference == "" || len(clientReference) > maxClientReference {
 		diags.AddError("Invalid client reference",
 			fmt.Sprintf("Every order needs a client reference of 1 to %d characters, got %q (provider bug).", maxClientReference, clientReference))
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
-	key, err := idempotencyKey(itemType, clientReference, item)
+	promoCode := strings.TrimSpace(opts.PromoCode)
+	key, err := idempotencyKey(itemType, clientReference, item, promoCode)
 	if err != nil {
 		diags.AddError("Cannot build the order", err.Error())
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
 	if timeout <= 0 {
 		timeout = defaultCreateTimeout
@@ -114,7 +165,7 @@ func orderResource(ctx context.Context, c *client.Client, item map[string]any, c
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req := client.OrderRequest{Items: []map[string]any{orderItem(item, clientReference)}}
+	req := client.OrderRequest{Items: []map[string]any{orderItem(item, clientReference)}, PromoCode: promoCode}
 
 	// 1. Quote: the binding price, nothing is charged.
 	quote, err := c.Quote(ctx, req)
@@ -122,10 +173,10 @@ func orderResource(ctx context.Context, c *client.Client, item map[string]any, c
 		if ctx.Err() != nil {
 			diags.AddError("Order timed out", fmt.Sprintf("No price quote within %s. Nothing was ordered or charged; run apply again.\n\n%s",
 				timeout, describeError(err)))
-			return 0, false, diags
+			return 0, orderNew, diags
 		}
 		addOrderError(&diags, "Price quote failed", err, nil)
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
 
 	// 2. Cost protection.
@@ -133,46 +184,60 @@ func orderResource(ctx context.Context, c *client.Client, item map[string]any, c
 		diags.AddError("Price above max_price",
 			fmt.Sprintf("The order costs %.2f EUR, max_price allows %.2f EUR. Nothing was ordered or charged. "+
 				"Raise max_price or change the configuration.", quote.Total, *maxPrice))
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
 
-	// 3. Order. While the API still processes an earlier request with this key
-	//    (IDEMPOTENCY_IN_PROGRESS — e.g. a slow request that outlived the HTTP
-	//    timeout and was retried), wait and retry with the SAME key until the
-	//    order is replayed, an error is definitive, or the timeout ends.
-	order, err := placeOrder(ctx, c, req, quote.Total, key)
-	if err != nil {
-		if client.IsCode(err, client.CodeClientReferenceInUse) {
-			return adoptReference(err, wantResourceType, clientReference)
+	// 3. Order, following the key rules above.
+	var order *client.Order
+	conflictRetried := false
+	for links := 0; ; {
+		order, err = placeOrder(ctx, c, req, quote.Total, key)
+		if err != nil {
+			if client.IsCode(err, client.CodeClientReferenceInUse) {
+				return adoptReference(err, wantResourceType, clientReference)
+			}
+			if client.IsCode(err, client.CodeIdempotencyConflict) && !conflictRetried {
+				conflictRetried = true
+				key = conflictKey(key, quote.Total)
+				continue
+			}
+			addPlaceOrderError(ctx, &diags, err, timeout, quote, conflictRetried)
+			return 0, orderNew, diags
 		}
-		switch {
-		case client.IsCode(err, client.CodeIdempotencyInProgress):
-			diags.AddError("Order timed out",
-				fmt.Sprintf("An earlier request for this order (same Idempotency-Key) was still being processed by the API after %s. "+
-					"Run apply again — it will not be bought twice: the next apply uses the same key and gets this order.\n\n%s",
-					timeout, describeError(err)))
-		case ctx.Err() != nil || isTransportError(err):
-			diags.AddError("Order outcome unknown",
-				fmt.Sprintf("The order request did not complete (timeout %s); it may or may not have been placed. "+
-					"Run apply again — it will not be bought twice: the next apply uses the same Idempotency-Key and gets the order if it was placed.\n\n%s",
-					timeout, describeError(err)))
-		default:
-			addOrderError(&diags, "Order failed", err, quote)
+		if !order.Replayed || !termOver(order, item, time.Now()) {
+			break
 		}
-		return 0, false, diags
+		if links >= maxKeyChain {
+			diags.AddError("Too many earlier orders",
+				fmt.Sprintf("This configuration was ordered more than %d times before and every term is over; the provider follows the chain no further. "+
+					"Nothing was charged now. Use another client reference (hostname or name).", maxKeyChain))
+			return 0, orderNew, diags
+		}
+		// The order under this key ran out: buy again under the next link.
+		key = chainKey(key, order.ID)
+		links++
+	}
+	if conflictRetried && !order.Replayed {
+		diags.AddWarning("Ordered under a follow-up key",
+			"An earlier order with the same configuration but other details (for example another password or price) exists, "+
+				"and no live resource carries this client reference any more, so the item was bought again: "+
+				"the earlier resource ran out or was deleted.")
 	}
 
 	if len(order.Items) != 1 {
 		diags.AddError("Unexpected order response", fmt.Sprintf("Order %s has %d items, expected 1.", order.ID, len(order.Items)))
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
 	placed := order.Items[0]
 	if placed.ResourceType != wantResourceType || placed.ResourceID == 0 {
 		diags.AddError("Unexpected order response",
 			fmt.Sprintf("Order %s created %s %d, expected a %s.", order.ID, placed.ResourceType, placed.ResourceID, wantResourceType))
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
-	resourceID, adopted = placed.ResourceID, order.Replayed
+	resourceID = placed.ResourceID
+	if order.Replayed && placedBefore(order, start) {
+		outcome = orderReplayed
+	}
 
 	// 4. Wait for provisioning.
 	if placed.Status != client.StatusActive {
@@ -181,26 +246,126 @@ func orderResource(ctx context.Context, c *client.Client, item map[string]any, c
 		case err == nil:
 		case errors.Is(err, client.ErrItemFailed):
 			diags.AddError("Provisioning failed",
-				fmt.Sprintf("Order %s was paid, but provisioning %s %d failed. Contact support with the order id; "+
-					"running apply again does not buy it again (same Idempotency-Key) but will report the same failure.",
+				fmt.Sprintf("Order %s was paid, but provisioning %s %d failed. Contact support with the order id. "+
+					"Running apply again does not buy it again within its term (same Idempotency-Key) and reports this failure again.",
 					order.ID, placed.ResourceType, placed.ResourceID))
-			return resourceID, adopted, diags
+			return resourceID, outcome, diags
 		case ctx.Err() != nil:
 			diags.AddError("Order timed out",
 				fmt.Sprintf("Order %s is already paid, but %s %d was not active after %s. "+
 					"Run apply again — it will not be bought twice: the next apply uses the same Idempotency-Key and takes this order over.\n\n%s",
 					order.ID, placed.ResourceType, placed.ResourceID, timeout, err))
-			return resourceID, adopted, diags
+			return resourceID, outcome, diags
 		default:
 			diags.AddError("Order status unknown",
 				fmt.Sprintf("Order %s is already paid, but its status could not be read. "+
 					"Run apply again — it will not be bought twice: the next apply uses the same Idempotency-Key and takes this order over.\n\n%s",
 					order.ID, describeError(err)))
-			return resourceID, adopted, diags
+			return resourceID, outcome, diags
 		}
 	}
 
-	return resourceID, adopted, diags
+	return resourceID, outcome, diags
+}
+
+func addPlaceOrderError(ctx context.Context, diags *diag.Diagnostics, err error, timeout time.Duration, quote *client.Quote, afterConflict bool) {
+	switch {
+	case client.IsCode(err, client.CodeIdempotencyInProgress):
+		diags.AddError("Order timed out",
+			fmt.Sprintf("An earlier request for this order (same Idempotency-Key) was still being processed by the API after %s. "+
+				"Run apply again — it will not be bought twice: the next apply uses the same key and gets this order.\n\n%s",
+				timeout, describeError(err)))
+	case ctx.Err() != nil || isTransportError(err):
+		diags.AddError("Order outcome unknown",
+			fmt.Sprintf("The order request did not complete (timeout %s); it may or may not have been placed. "+
+				"Run apply again — it will not be bought twice: the next apply uses the same Idempotency-Key and gets the order if it was placed.\n\n%s",
+				timeout, describeError(err)))
+	case afterConflict && client.IsCode(err, client.CodeIdempotencyConflict):
+		diags.AddError("Order conflicts with earlier orders",
+			"An order with the same product configuration was already placed with other details (for example another password, SSH keys, "+
+				"contact or price), and so was the follow-up order the provider tried instead. Nothing was charged now. "+
+				"Restore the configuration of the earlier order, or take the existing resource over with `terraform import`.\n\n"+
+				"About the follow-up order: the API refuses it while a live resource carries this client reference (the provider then "+
+				"takes that resource over), so it only buys when no live resource with this reference exists — that is, when the "+
+				"earlier resource ran out or was deleted, even before the end of its term.\n\n"+describeError(err))
+	default:
+		addOrderError(diags, "Order failed", err, quote)
+	}
+}
+
+// termOver reports whether the term of a replayed order has ended:
+// created_at + the item's duration (rootserver: duration_days days, default
+// 30; rootpacket and domain: duration_months months, default 1) lies before
+// now. An unreadable created_at counts as "not over": the engine then never
+// buys again.
+func termOver(order *client.Order, item map[string]any, now time.Time) bool {
+	created, err := time.Parse(time.RFC3339, order.CreatedAt)
+	if err != nil {
+		return false
+	}
+	var end time.Time
+	if itemType, _ := item["type"].(string); itemType == "rootserver" {
+		days, ok := number(item["duration_days"])
+		if !ok || days < 1 {
+			days = 30
+		}
+		end = created.AddDate(0, 0, int(days))
+	} else {
+		months, ok := number(item["duration_months"])
+		if !ok || months < 1 {
+			months = 1
+		}
+		end = created.AddDate(0, int(months), 0)
+	}
+	return end.Before(now)
+}
+
+// placedBefore reports whether the order was created before this call
+// started. created_at has second precision, so this call's own order (lost
+// response, retried) is never older than the second the call started in. An
+// unreadable created_at counts as earlier (auto-renew is then switched on,
+// which is harmless).
+func placedBefore(order *client.Order, start time.Time) bool {
+	created, err := time.Parse(time.RFC3339, order.CreatedAt)
+	if err != nil {
+		return true
+	}
+	return created.Before(start.Truncate(time.Second))
+}
+
+func number(v any) (float64, bool) {
+	switch x := v.(type) {
+	case int:
+		return float64(x), true
+	case int32:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case float64:
+		return x, true
+	case json.Number:
+		f, err := x.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		return f, err == nil
+	}
+	return 0, false
+}
+
+// chainKey is the key for buying again after the order under prev ran out:
+// "tf-" + hex(sha256(prev + "\x00" + order id)).
+func chainKey(prev, orderID string) string {
+	sum := sha256.Sum256([]byte(prev + "\x00" + orderID))
+	return "tf-" + hex.EncodeToString(sum[:])
+}
+
+// conflictKey is the single follow-up key after IDEMPOTENCY_CONFLICT:
+// "tf-" + hex(sha256(key + "\x00conflict\x00" + total in cents)). No password
+// material; a price change leads to its own key.
+func conflictKey(key string, total float64) string {
+	sum := sha256.Sum256([]byte(key + "\x00conflict\x00" + strconv.FormatInt(cents(total), 10)))
+	return "tf-" + hex.EncodeToString(sum[:])
 }
 
 // placeOrder sends POST /orders and waits out IDEMPOTENCY_IN_PROGRESS with
@@ -224,7 +389,7 @@ func placeOrder(ctx context.Context, c *client.Client, req client.OrderRequest, 
 	}
 }
 
-func adoptReference(err error, wantResourceType, clientReference string) (int64, bool, diag.Diagnostics) {
+func adoptReference(err error, wantResourceType, clientReference string) (int64, orderOutcome, diag.Diagnostics) {
 	var diags diag.Diagnostics
 	apiErr, _ := client.AsAPIError(err)
 	id, ok := apiErr.Int64("resource_id")
@@ -232,15 +397,15 @@ func adoptReference(err error, wantResourceType, clientReference string) (int64,
 	if !ok || id <= 0 {
 		diags.AddError("Client reference in use",
 			fmt.Sprintf("The client reference %q is used by a live resource, but the API did not name it.\n\n%s", clientReference, describeError(err)))
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
 	if resourceType != wantResourceType {
 		diags.AddError("Client reference in use",
 			fmt.Sprintf("The client reference %q is used by %s %d, which cannot be managed as a %s. Nothing was charged. "+
 				"Use another name.\n\n%s", clientReference, resourceType, id, wantResourceType, describeError(err)))
-		return 0, false, diags
+		return 0, orderNew, diags
 	}
-	return id, true, diags
+	return id, orderReferenceInUse, diags
 }
 
 // addOrderError adds an API error with a hint on what to do about it.
@@ -331,13 +496,14 @@ func orderItem(item map[string]any, clientReference string) map[string]any {
 }
 
 // idempotencyKey is "tf-" + hex(sha256(type + "\x00" + clientReference + "\x00"
-// + canonical JSON of the purchase fields)). It depends only on the
+// + canonical JSON of the purchase fields [+ "\x00promo_code\x00" + order
+// promo code, when set])). It depends only on the
 // configuration, so every process computes the same key for the same order.
 // Canonical JSON: object keys sorted, no whitespace, nil/absent fields
 // omitted, integral numbers without fraction (2, 2.0 and "2" as json.Number
 // are all 2). The key material holds no secrets (see purchaseFields) and is
 // never logged.
-func idempotencyKey(itemType, clientReference string, item map[string]any) (string, error) {
+func idempotencyKey(itemType, clientReference string, item map[string]any, promoCode string) (string, error) {
 	fields, ok := purchaseFields[itemType]
 	if !ok {
 		return "", fmt.Errorf("unsupported order type %q", itemType)
@@ -359,6 +525,10 @@ func idempotencyKey(itemType, clientReference string, item map[string]any) (stri
 	h.Write([]byte(clientReference))
 	h.Write([]byte{0})
 	h.Write(canonical)
+	if promoCode != "" {
+		h.Write([]byte("\x00promo_code\x00"))
+		h.Write([]byte(promoCode))
+	}
 	return "tf-" + hex.EncodeToString(h.Sum(nil)), nil
 }
 

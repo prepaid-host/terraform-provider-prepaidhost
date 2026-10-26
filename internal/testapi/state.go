@@ -215,6 +215,39 @@ func (s *Server) SetProvisioner(resourceType string, fn func(item, attrs map[str
 	s.With(func(st *State) { st.Provisioners[resourceType] = fn })
 }
 
+// SetOrderCreatedAt backdates an order (GET /orders/{uuid} and the stored
+// response its Idempotency-Key replays), e.g. to simulate an order whose
+// term is over.
+func (s *Server) SetOrderCreatedAt(orderID string, at time.Time) {
+	ts := at.UTC().Format(time.RFC3339)
+	s.With(func(st *State) {
+		if o, ok := st.Orders[orderID]; ok {
+			o.CreatedAt = ts
+		}
+		for _, e := range st.Idempotency {
+			env, ok := e.Response.Body.(successEnvelope)
+			if !ok {
+				continue
+			}
+			if m, ok := env.Result.(map[string]any); ok && m["id"] == orderID {
+				m["created_at"] = ts
+			}
+		}
+	})
+}
+
+// OrderIDs lists the ids of all placed orders.
+func (s *Server) OrderIDs() []string {
+	var ids []string
+	s.With(func(st *State) {
+		for id := range st.Orders {
+			ids = append(ids, id)
+		}
+	})
+	sort.Strings(ids)
+	return ids
+}
+
 // SetOrderItemStatus forces the status of one item of an order.
 func (s *Server) SetOrderItemStatus(orderID string, index int, status string) {
 	s.With(func(st *State) {
