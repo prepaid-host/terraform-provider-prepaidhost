@@ -11,9 +11,12 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	tfresource "github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
+	"github.com/prepaid-host/terraform-provider-prepaidhost/internal/client"
 	"github.com/prepaid-host/terraform-provider-prepaidhost/internal/testapi"
 )
 
@@ -199,18 +202,110 @@ func TestAccDomainContact_ReplacedWhenChanged(t *testing.T) {
 	)
 }
 
-func TestAccDomainContact_ChangeWithSameNameAndEmailCannotBeApplied(t *testing.T) {
+func TestAccDomainContact_ChangeWithSameNameAndEmailFailsAtPlan(t *testing.T) {
 	api := testapi.New(t)
+	var writes int
 
 	accTest(t,
-		tfresource.TestStep{Config: contactConfig(api, nil)},
-		// A new street is a replacement, which the API answers with DUPLICATE_CONTACT
-		// (same name and email) for a contact that differs: no silent adoption.
 		tfresource.TestStep{
-			Config:      contactConfig(api, map[string]string{"street": "Nebenstr."}),
-			ExpectError: re(`(?s)DUPLICATE_CONTACT.*street`),
+			Config: contactConfig(api, nil),
+			Check: func(*terraform.State) error {
+				writes = api.WriteCount()
+				return nil
+			},
+		},
+		// A new street would replace the contact, and the create would fail with
+		// DUPLICATE_CONTACT forever: refuse at plan time, case-insensitively for the key.
+		tfresource.TestStep{
+			Config:      contactConfig(api, map[string]string{"street": "Nebenstr.", "email": "MAX@example.com"}),
+			PlanOnly:    true,
+			ExpectError: re(`(?s)cannot be changed.*street`),
+		},
+		tfresource.TestStep{
+			Config: contactConfig(api, nil),
+			Check: func(*terraform.State) error {
+				if got := api.WriteCount(); got != writes {
+					return fmt.Errorf("plan error caused %d write calls", got-writes)
+				}
+				return nil
+			},
 		},
 	)
+}
+
+func TestAccDomainContact_ImportThenAdoptWriteOnlyFieldsInPlace(t *testing.T) {
+	api := testapi.New(t)
+	id := api.SeedDomainContact(nil)
+	idStr := strconv.FormatInt(id, 10)
+	cfg := contactConfig(api, map[string]string{"fax": "+49.3012345679", "idcard": "X1234567"})
+
+	accTest(t,
+		initStep(api),
+		tfresource.TestStep{
+			Config:             importConfig(cfg),
+			ResourceName:       contactAddr,
+			ImportState:        true,
+			ImportStateId:      idStr,
+			ImportStatePersist: true,
+		},
+		tfresource.TestStep{
+			Config: cfg,
+			Check: tfresource.ComposeAggregateTestCheckFunc(
+				tfresource.TestCheckResourceAttr(contactAddr, "id", idStr),
+				tfresource.TestCheckResourceAttr(contactAddr, "fax", "+49.3012345679"),
+				tfresource.TestCheckResourceAttr(contactAddr, "idcard", "X1234567"),
+				func(*terraform.State) error {
+					if got := api.WriteCount(); got != 0 {
+						return fmt.Errorf("adopting made %d write calls", got)
+					}
+					return nil
+				},
+			),
+		},
+	)
+}
+
+func TestDomainContact_AdoptionWarns(t *testing.T) {
+	api := testapi.New(t)
+	existing := api.SeedDomainContact(nil)
+
+	ctx := context.Background()
+	res := NewDomainContactResource().(*domainContactResource) //nolint:forcetypeassert // test
+	res.client = client.New(api.URL, api.Token)
+
+	var sch resource.SchemaResponse
+	res.Schema(ctx, resource.SchemaRequest{}, &sch)
+	values := map[string]tftypes.Value{}
+	set := map[string]string{
+		"type": "PERS", "sex": "MALE", "firstname": "Max", "lastname": "Mustermann", "street": "Hauptstr.",
+		"number": "1", "postcode": "12345", "city": "Berlin", "country": "DE", "phone": "+49.3012345678",
+		"email": "max@example.com",
+	}
+	for name, attr := range sch.Schema.Attributes {
+		typ := attr.GetType().TerraformType(ctx)
+		switch {
+		case set[name] != "":
+			values[name] = tftypes.NewValue(tftypes.String, set[name])
+		case attr.IsComputed():
+			values[name] = tftypes.NewValue(typ, tftypes.UnknownValue)
+		default:
+			values[name] = tftypes.NewValue(typ, nil)
+		}
+	}
+	objType := sch.Schema.Type().TerraformType(ctx)
+	req := resource.CreateRequest{Plan: tfsdk.Plan{Schema: sch.Schema, Raw: tftypes.NewValue(objType, values)}}
+	resp := resource.CreateResponse{State: tfsdk.State{Schema: sch.Schema, Raw: tftypes.NewValue(objType, nil)}}
+
+	res.Create(ctx, req, &resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("create: %v", resp.Diagnostics)
+	}
+	warnings := resp.Diagnostics.Warnings()
+	if len(warnings) != 1 || warnings[0].Summary() != "Existing domain contact adopted" ||
+		!strings.Contains(warnings[0].Detail(), strconv.FormatInt(existing, 10)) {
+		t.Errorf("want the adoption warning naming id %d, got %v", existing, resp.Diagnostics)
+	}
 }
 
 func TestAccDomainContact_DuplicateIsAdopted(t *testing.T) {
@@ -340,9 +435,10 @@ func TestAccDomainContact_ChangedInPanelShowsDrift(t *testing.T) {
 				n, _ := strconv.ParseInt(id, 10, 64)
 				api.UpdateResource(testapi.ResourceDomainContact, n, func(a map[string]any) { a["street"] = "Geaendert" })
 			},
-			Config:             contactConfig(api, nil),
-			PlanOnly:           true,
-			ExpectNonEmptyPlan: true,
+			// Drift would replace the contact, which cannot work: it is reported at plan time.
+			Config:      contactConfig(api, nil),
+			PlanOnly:    true,
+			ExpectError: re(`(?s)cannot be changed.*street`),
 		},
 	)
 }

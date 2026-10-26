@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -28,6 +29,7 @@ var (
 	_ resource.Resource                = &domainContactResource{}
 	_ resource.ResourceWithConfigure   = &domainContactResource{}
 	_ resource.ResourceWithImportState = &domainContactResource{}
+	_ resource.ResourceWithModifyPlan  = &domainContactResource{}
 )
 
 var dateFormat = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
@@ -118,6 +120,7 @@ type contactText struct {
 	required   bool
 	computed   bool // optional and filled by the API when not configured
 	sensitive  bool
+	writeOnly  bool // not returned by the API
 	validators []validator.String
 }
 
@@ -126,7 +129,17 @@ func replaceString(t contactText) schema.StringAttribute {
 	if t.computed {
 		mods = append(mods, stringplanmodifier.UseStateForUnknown())
 	}
-	mods = append(mods, stringplanmodifier.RequiresReplace())
+	if t.writeOnly {
+		// The API never returns these: a null state value means "imported, unknown"
+		// and the configured value is adopted in place (see Update).
+		desc := "Replaces the contact when the value changes, unless it was unknown after an import."
+		mods = append(mods, stringplanmodifier.RequiresReplaceIf(
+			func(_ context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
+				resp.RequiresReplace = !req.StateValue.IsNull()
+			}, desc, desc))
+	} else {
+		mods = append(mods, stringplanmodifier.RequiresReplace())
+	}
 	return schema.StringAttribute{
 		MarkdownDescription: t.desc,
 		Required:            t.required,
@@ -146,7 +159,7 @@ func (r *domainContactResource) Schema(_ context.Context, _ resource.SchemaReque
 	date := []validator.String{stringvalidator.RegexMatches(dateFormat, "must be a date in the format YYYY-MM-DD")}
 	country2 := []validator.String{stringvalidator.LengthBetween(2, 2)}
 	ident := func(desc string, v ...validator.String) schema.StringAttribute {
-		return replaceString(contactText{desc: desc + " Only needed for TLDs that require identification of the holder (for example `.it`). The API never returns it.", sensitive: true, validators: v})
+		return replaceString(contactText{desc: desc + " Only needed for TLDs that require identification of the holder (for example `.it`). The API never returns it.", sensitive: true, writeOnly: true, validators: v})
 	}
 
 	resp.Schema = schema.Schema{
@@ -155,8 +168,11 @@ func (r *domainContactResource) Schema(_ context.Context, _ resource.SchemaReque
 			"**The API can neither change nor delete contacts.** Every argument change therefore replaces the resource, which only works " +
 			"when first name, last name and email differ (the API refuses a second contact with the same ones). " +
 			"Destroying the resource only removes it from the Terraform state; the contact stays in the account and can be removed in the customer panel. " +
-			"If an identical contact already exists, it is adopted instead of created.\n\n" +
-			"An account holds at most 10 contacts.",
+			"If an identical contact already exists, it is adopted instead of created. " +
+			"`fax` and the identification fields are never returned by the API: after `terraform import` they are null in the state, " +
+			"and the first apply with a configured value adopts it in place without replacing the contact.\n\n" +
+			"An account holds at most 10 contacts.\n\n" +
+			"~> **Note:** Sensitive values (the identification fields) are hidden in plan output but are still stored in the state file in plain text. Protect your state.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				MarkdownDescription: "Contact id (the holder id for domain orders).",
@@ -186,7 +202,7 @@ func (r *domainContactResource) Schema(_ context.Context, _ resource.SchemaReque
 			"region":       replaceString(contactText{desc: "Region or state. Defaults to the city.", computed: true}),
 			"country":      replaceString(contactText{desc: "Two-letter ISO 3166-1 country code, for example `DE`.", required: true, validators: country2}),
 			"phone":        replaceString(contactText{desc: "Phone number in international format, for example `+49.3012345678`.", required: true}),
-			"fax":          replaceString(contactText{desc: "Fax number. The API does not return it."}),
+			"fax":          replaceString(contactText{desc: "Fax number. The API does not return it.", writeOnly: true}),
 			"email":        replaceString(contactText{desc: "Email address. The API stores it in lowercase.", required: true}),
 			"is_default": schema.BoolAttribute{
 				MarkdownDescription: "Make this the default contact. Evaluated when the contact is created; the first contact of an account is always the default. " +
@@ -459,10 +475,88 @@ func (r *domainContactResource) Read(ctx context.Context, req resource.ReadReque
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// Update is never called: every argument requires replacement.
-func (r *domainContactResource) Update(_ context.Context, _ resource.UpdateRequest, resp *resource.UpdateResponse) {
-	resp.Diagnostics.AddError("Domain contacts cannot be updated",
-		"The API has no update endpoint for domain contacts; this is a provider bug, every change should have planned a replacement.")
+// Update only runs to adopt fax/identification values after an import (every
+// other change replaces the contact); nothing is sent to the API.
+func (r *domainContactResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state domainContactModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	plan.ID = state.ID
+	plan.HandleCode = state.HandleCode
+	plan.APIHandleID = state.APIHandleID
+	plan.settle()
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// userAttributes are the arguments the API takes on create, by name.
+func (m *domainContactModel) userAttributes() map[string]types.String {
+	attrs := map[string]types.String{
+		"name": m.Name, "type": m.Type, "sex": m.Sex, "firstname": m.Firstname, "lastname": m.Lastname,
+		"organisation": m.Organisation, "street": m.Street, "number": m.Number, "postcode": m.Postcode,
+		"city": m.City, "region": m.Region, "country": m.Country, "phone": m.Phone, "fax": m.Fax, "email": m.Email,
+	}
+	for k, v := range m.identificationFields() {
+		attrs[k] = v
+	}
+	return attrs
+}
+
+var writeOnlyContactAttributes = map[string]bool{
+	"fax": true, "idcard": true, "idcardissuedate": true, "idcardauthority": true, "taxnr": true,
+	"vatnr": true, "dateofbirth": true, "countryofbirth": true, "placeofbirth": true,
+	"regionofbirth": true, "registrationnumber": true,
+}
+
+// ModifyPlan refuses a replacement that cannot succeed: the API treats a
+// contact with the same first name, last name and email as a duplicate, and
+// cannot delete the old one, so the create after the replace would fail on
+// every apply.
+func (r *domainContactResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	var plan, state domainContactModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	stateAttrs := state.userAttributes()
+	var changed []string
+	for name, p := range plan.userAttributes() {
+		if p.IsUnknown() {
+			continue
+		}
+		s := stateAttrs[name]
+		if writeOnlyContactAttributes[name] && s.IsNull() {
+			continue // adopted in place
+		}
+		loose := name == "firstname" || name == "lastname" || name == "email"
+		if (loose && !equivalent(p.ValueString(), s.ValueString())) || (!loose && !p.Equal(s)) {
+			changed = append(changed, name)
+		}
+	}
+	if !plan.IsDefault.IsUnknown() && !plan.IsDefault.Equal(state.IsDefault) {
+		changed = append(changed, "is_default")
+	}
+	if len(changed) == 0 {
+		return
+	}
+	for _, k := range []string{"firstname", "lastname", "email"} {
+		if !equivalent(plan.userAttributes()[k].ValueString(), stateAttrs[k].ValueString()) {
+			return // a new contact can be created
+		}
+	}
+	sort.Strings(changed)
+	resp.Diagnostics.AddError("Domain contact cannot be changed",
+		fmt.Sprintf("Changing %s would replace contact %s, but the API can neither change nor delete contacts and refuses a new contact "+
+			"with the same first name, last name and email (DUPLICATE_CONTACT). To create a new contact change the first name, last name or email; "+
+			"to use the existing one keep the configuration as it is, or import the matching contact (`terraform import <address> <id>`) and change the "+
+			"configuration to it.", strings.Join(changed, ", "), state.ID.ValueString()))
 }
 
 // Delete only forgets the contact: the API has no delete endpoint.

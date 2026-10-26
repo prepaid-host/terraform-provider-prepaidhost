@@ -220,7 +220,7 @@ func (r *sshKeyResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 
-	if got := sshFingerprint(plan.PublicKey.ValueString()); got != state.Fingerprint.ValueString() {
+	if got := sshFingerprint(plan.PublicKey.ValueString()); got == "" || got != state.Fingerprint.ValueString() {
 		resp.Diagnostics.AddAttributeError(path.Root("public_key"), "public_key does not match the stored key",
 			fmt.Sprintf("The imported key %s has the fingerprint %s, but the configured public_key has the fingerprint %q. "+
 				"Configure the public key that belongs to this key, or remove the key from the state and let Terraform create a new one.",

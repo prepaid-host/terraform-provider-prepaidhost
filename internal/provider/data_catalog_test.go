@@ -106,3 +106,31 @@ func TestAccCatalogDataSource_APIError(t *testing.T) {
 		ExpectError: re(`UNAUTHENTICATED`),
 	})
 }
+
+func testStepCatalog(api *testapi.Server, addr string) resource.TestStep {
+	return resource.TestStep{
+		Config: providerConfig(api) + `data "prepaidhost_catalog" "this" { type = "rootpacket" }`,
+		Check: resource.ComposeAggregateTestCheckFunc(
+			resource.TestCheckResourceAttr(addr, "packets.0.cores", "2"),
+			resource.TestCheckResourceAttr(addr, "packets.0.memory", "2048"),
+			resource.TestCheckResourceAttr(addr, "packets.0.disk", "40"),
+			resource.TestCheckResourceAttr(addr, "packets.0.addresses", "1"),
+			resource.TestCheckResourceAttr(addr, "packets.0.backups", "3"),
+			resource.TestCheckResourceAttr(addr, "packets.0.traffic", "1000"),
+		),
+	}
+}
+
+func TestAccCatalogDataSource_PacketNumbersAsStrings(t *testing.T) {
+	api := testapi.New(t)
+	api.SetCatalog("rootpacket", map[string]any{
+		"packets": []any{map[string]any{
+			"id": "7", "name": "Str", "cores": "2", "memory": "2048", "disk": "40", "addresses": "1", "backups": "3",
+			"traffic": 1000, "price_monthly": 5.0, "active_promo_percent": 0.0,
+		}},
+		"durations_months": []any{1},
+		"templates":        []any{},
+	})
+	const addr = "data.prepaidhost_catalog.this"
+	accTest(t, testStepCatalog(api, addr))
+}

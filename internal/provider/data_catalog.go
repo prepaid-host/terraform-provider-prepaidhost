@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -50,6 +52,36 @@ func (f *flexString) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// flexInt decodes a JSON number or numeric string (the packet data is a JSON
+// column and may hold either).
+type flexInt int64
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err == nil {
+		v, err := n.Int64()
+		if err != nil {
+			fl, ferr := n.Float64()
+			if ferr != nil {
+				return fmt.Errorf("expected integer, got %s", b)
+			}
+			v = int64(fl)
+		}
+		*f = flexInt(v)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("expected integer or numeric string, got %s", b)
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return fmt.Errorf("expected integer or numeric string, got %s", b)
+	}
+	*f = flexInt(v)
+	return nil
+}
+
 // catalogModel is both the API result (json tags; the fields not used by a
 // type stay nil) and the Terraform state (tfsdk tags; nil = null).
 type catalogModel struct {
@@ -85,13 +117,13 @@ type catalogDuration struct {
 }
 
 type catalogPacket struct {
-	ID                 int64      `tfsdk:"id" json:"id"`
+	ID                 flexInt    `tfsdk:"id" json:"id"`
 	Name               string     `tfsdk:"name" json:"name"`
-	Cores              int64      `tfsdk:"cores" json:"cores"`
-	Memory             int64      `tfsdk:"memory" json:"memory"`
-	Disk               int64      `tfsdk:"disk" json:"disk"`
-	Addresses          int64      `tfsdk:"addresses" json:"addresses"`
-	Backups            int64      `tfsdk:"backups" json:"backups"`
+	Cores              flexInt    `tfsdk:"cores" json:"cores"`
+	Memory             flexInt    `tfsdk:"memory" json:"memory"`
+	Disk               flexInt    `tfsdk:"disk" json:"disk"`
+	Addresses          flexInt    `tfsdk:"addresses" json:"addresses"`
+	Backups            flexInt    `tfsdk:"backups" json:"backups"`
 	Traffic            flexString `tfsdk:"traffic" json:"traffic"`
 	PriceMonthly       float64    `tfsdk:"price_monthly" json:"price_monthly"`
 	ActivePromoPercent float64    `tfsdk:"active_promo_percent" json:"active_promo_percent"`
