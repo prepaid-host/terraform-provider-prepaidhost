@@ -144,7 +144,10 @@ func (p *PrepaidHostProvider) Resources(_ context.Context) []func() resource.Res
 
 // DataSources lists the data sources.
 func (p *PrepaidHostProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{}
+	return []func() datasource.DataSource{
+		NewBalanceDataSource,
+		NewCatalogDataSource,
+	}
 }
 
 // isLoopback reports whether host is localhost or a loopback IP (plain http is fine there).

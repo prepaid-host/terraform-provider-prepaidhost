@@ -42,6 +42,9 @@ type State struct {
 	// file decides how it presents them.
 	Resources map[string]map[int64]map[string]any
 
+	// Catalogs overrides GET /catalog/{type} per type (see Server.SetCatalog).
+	Catalogs map[string]map[string]any
+
 	Orders      map[string]*Order
 	Idempotency map[string]*IdempotencyEntry
 	Charges     []Charge
