@@ -556,7 +556,8 @@ func (r *domainContactResource) ModifyPlan(ctx context.Context, req resource.Mod
 		fmt.Sprintf("Changing %s would replace contact %s, but the API can neither change nor delete contacts and refuses a new contact "+
 			"with the same first name, last name and email (DUPLICATE_CONTACT). To create a new contact change the first name, last name or email; "+
 			"to use the existing one keep the configuration as it is, or import the matching contact (`terraform import <address> <id>`) and change the "+
-			"configuration to it.", strings.Join(changed, ", "), state.ID.ValueString()))
+			"configuration to it.\n\nIf the contact was changed in the customer panel, set the configuration to the panel values or revert the change "+
+			"there; alternatively `terraform state rm <address>` and import the matching contact.", strings.Join(changed, ", "), state.ID.ValueString()))
 }
 
 // Delete only forgets the contact: the API has no delete endpoint.

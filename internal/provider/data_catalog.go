@@ -53,10 +53,15 @@ func (f *flexString) UnmarshalJSON(b []byte) error {
 }
 
 // flexInt decodes a JSON number or numeric string (the packet data is a JSON
-// column and may hold either).
+// column and may hold either). null and an empty string decode to 0: an
+// unset packet value means "none" (e.g. no backups), not broken data.
 type flexInt int64
 
 func (f *flexInt) UnmarshalJSON(b []byte) error {
+	if t := strings.TrimSpace(string(b)); t == "null" {
+		*f = 0
+		return nil
+	}
 	var n json.Number
 	if err := json.Unmarshal(b, &n); err == nil {
 		v, err := n.Int64()
@@ -74,7 +79,12 @@ func (f *flexInt) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return fmt.Errorf("expected integer or numeric string, got %s", b)
 	}
-	v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	s = strings.TrimSpace(s)
+	if s == "" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
 		return fmt.Errorf("expected integer or numeric string, got %s", b)
 	}

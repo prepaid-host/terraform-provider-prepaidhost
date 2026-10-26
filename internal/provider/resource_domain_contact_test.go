@@ -435,10 +435,11 @@ func TestAccDomainContact_ChangedInPanelShowsDrift(t *testing.T) {
 				n, _ := strconv.ParseInt(id, 10, 64)
 				api.UpdateResource(testapi.ResourceDomainContact, n, func(a map[string]any) { a["street"] = "Geaendert" })
 			},
-			// Drift would replace the contact, which cannot work: it is reported at plan time.
+			// Drift would replace the contact, which cannot work: it is reported at plan time,
+			// with the ways out of a change made in the panel.
 			Config:      contactConfig(api, nil),
 			PlanOnly:    true,
-			ExpectError: re(`(?s)cannot be changed.*street`),
+			ExpectError: re(`(?s)cannot be changed.*street.*changed\s+in\s+the\s+customer\s+panel.*panel\s+values.*revert.*state\s+rm.*import`),
 		},
 	)
 }

@@ -4,6 +4,7 @@
 package provider
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -133,4 +134,45 @@ func TestAccCatalogDataSource_PacketNumbersAsStrings(t *testing.T) {
 	})
 	const addr = "data.prepaidhost_catalog.this"
 	accTest(t, testStepCatalog(api, addr))
+}
+
+func TestFlexInt_NullAndEmptyAreZero(t *testing.T) {
+	cases := map[string]int64{
+		`null`:   0,
+		`""`:     0,
+		`"  "`:   0,
+		`7`:      7,
+		`"8"`:    8,
+		`4.0`:    4,
+		`" 12 "`: 12,
+	}
+	for in, want := range cases {
+		var f flexInt
+		if err := json.Unmarshal([]byte(in), &f); err != nil {
+			t.Errorf("Unmarshal(%s): %v", in, err)
+			continue
+		}
+		if int64(f) != want {
+			t.Errorf("Unmarshal(%s) = %d, want %d", in, f, want)
+		}
+	}
+	for _, in := range []string{`"abc"`, `true`, `{}`, `[]`} {
+		var f flexInt
+		if err := json.Unmarshal([]byte(in), &f); err == nil {
+			t.Errorf("Unmarshal(%s): expected an error, got %d", in, f)
+		}
+	}
+}
+
+func TestFlexInt_NullInsidePacket(t *testing.T) {
+	var p struct {
+		ID      flexInt `json:"id"`
+		Backups flexInt `json:"backups"`
+	}
+	if err := json.Unmarshal([]byte(`{"id":3,"backups":null}`), &p); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if p.ID != 3 || p.Backups != 0 {
+		t.Fatalf("got id=%d backups=%d", p.ID, p.Backups)
+	}
 }
