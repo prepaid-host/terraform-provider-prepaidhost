@@ -378,3 +378,69 @@ func TestSetOrderItemStatus(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// A slow POST /orders: the order is charged, but the key keeps answering
+// IDEMPOTENCY_IN_PROGRESS for a while (like the API while the first request
+// still runs) before the completed order is replayed.
+func TestPlaceOrder_SlowOrderAnswersInProgressThenReplays(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	api.SetSlowOrder(2)
+	body := map[string]any{"items": []any{item("web1")}, "expected_total": 9.99}
+	key := map[string]string{"Idempotency-Key": "key-slow-0001"}
+
+	resp, _ := call(t, api, http.MethodPost, "/orders", api.Token, body, key)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first: status=%d", resp.StatusCode)
+	}
+	for i := 0; i < 2; i++ {
+		// In progress wins over a different body, as in OrderPlacementService.
+		other := map[string]any{"items": []any{item("web2")}, "expected_total": 9.99}
+		resp, env := call(t, api, http.MethodPost, "/orders", api.Token, other, key)
+		if resp.StatusCode != http.StatusConflict || env.Error["code"] != "IDEMPOTENCY_IN_PROGRESS" {
+			t.Fatalf("retry %d: status=%d env=%+v", i, resp.StatusCode, env)
+		}
+	}
+	resp, _ = call(t, api, http.MethodPost, "/orders", api.Token, body, key)
+	if resp.StatusCode != http.StatusCreated || resp.Header.Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("after: status=%d replayed=%q", resp.StatusCode, resp.Header.Get("Idempotent-Replayed"))
+	}
+	// The slow setting applies to one order only.
+	resp, _ = call(t, api, http.MethodPost, "/orders", api.Token,
+		map[string]any{"items": []any{item("web3")}, "expected_total": 9.99}, map[string]string{"Idempotency-Key": "key-slow-0002"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("next order: status=%d", resp.StatusCode)
+	}
+	resp, _ = call(t, api, http.MethodPost, "/orders", api.Token,
+		map[string]any{"items": []any{item("web3")}, "expected_total": 9.99}, map[string]string{"Idempotency-Key": "key-slow-0002"})
+	if resp.Header.Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("next order replay: status=%d", resp.StatusCode)
+	}
+	if api.ChargeCount() != 2 {
+		t.Errorf("charges = %d, want 2", api.ChargeCount())
+	}
+}
+
+// The request fingerprint is normalised like OrderPlacementService::requestHash:
+// expected_total to two decimals, promo_code trimmed and "" = absent.
+func TestPlaceOrder_FingerprintIsNormalised(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	key := map[string]string{"Idempotency-Key": "key-norm-0001"}
+
+	resp, _ := call(t, api, http.MethodPost, "/orders", api.Token,
+		map[string]any{"items": []any{item("web1")}, "expected_total": 9.99}, key)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("first: status=%d", resp.StatusCode)
+	}
+	resp, env := call(t, api, http.MethodPost, "/orders", api.Token,
+		map[string]any{"items": []any{item("web1")}, "expected_total": 9.990, "promo_code": "  "}, key)
+	if resp.StatusCode != http.StatusCreated || resp.Header.Get("Idempotent-Replayed") != "true" {
+		t.Fatalf("normalised replay: status=%d env=%+v", resp.StatusCode, env)
+	}
+	resp, env = call(t, api, http.MethodPost, "/orders", api.Token,
+		map[string]any{"items": []any{item("web1")}, "expected_total": 10.5}, key)
+	if resp.StatusCode != http.StatusConflict || env.Error["code"] != "IDEMPOTENCY_CONFLICT" {
+		t.Fatalf("other total: status=%d env=%+v", resp.StatusCode, env)
+	}
+}

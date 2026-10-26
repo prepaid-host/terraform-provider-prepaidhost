@@ -57,6 +57,10 @@ type State struct {
 	// rootserver). Key is the resource type.
 	Provisioners map[string]func(item, attrs map[string]any)
 
+	// SlowOrderAnswers > 0 makes the next placed order "slow": its key answers
+	// IDEMPOTENCY_IN_PROGRESS that many times before it is replayed.
+	SlowOrderAnswers int
+
 	nextID    int64
 	nextOrder int
 }
@@ -66,6 +70,11 @@ type IdempotencyEntry struct {
 	RequestHash string
 	InProgress  bool
 	Response    Response
+
+	// PendingAnswers > 0: the order is done (charged), but the key still
+	// answers IDEMPOTENCY_IN_PROGRESS that many more times — the API while
+	// the first, slow request is still running (see Server.SetSlowOrder).
+	PendingAnswers int
 }
 
 // Order is a placed order.
@@ -219,6 +228,13 @@ func (s *Server) SetOrderItemStatus(orderID string, index int, status string) {
 func (s *Server) MarkIdempotencyInProgress(key string) {
 	s.With(func(st *State) { st.Idempotency[key] = &IdempotencyEntry{InProgress: true} })
 }
+
+// SetSlowOrder makes the next successful POST /orders slow: it is charged as
+// usual, but the following n requests with its Idempotency-Key answer 409
+// IDEMPOTENCY_IN_PROGRESS (the first request "is still running") before the
+// completed order is replayed. Combine with DropAfterHandling to simulate a
+// POST that outlives the client's HTTP timeout.
+func (s *Server) SetSlowOrder(n int) { s.With(func(st *State) { st.SlowOrderAnswers = n }) }
 
 // ChargeCount is the number of charged orders (replays do not count).
 func (s *Server) ChargeCount() int {

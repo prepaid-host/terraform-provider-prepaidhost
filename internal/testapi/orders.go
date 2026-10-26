@@ -220,8 +220,21 @@ func handleQuote(st *State, r *Request) Response {
 	})
 }
 
+// requestHash fingerprints the body like OrderPlacementService::requestHash:
+// items with sorted keys (json.Marshal sorts map keys), expected_total with
+// two decimals, promo_code trimmed with "" meaning absent.
 func requestHash(body *orderBody) string {
-	b, _ := json.Marshal(body)
+	var promo *string
+	if body.PromoCode != nil {
+		if p := strings.TrimSpace(*body.PromoCode); p != "" {
+			promo = &p
+		}
+	}
+	b, _ := json.Marshal(map[string]any{
+		"items":          body.Items,
+		"expected_total": fmt.Sprintf("%.2f", *body.ExpectedTotal),
+		"promo_code":     promo,
+	})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
 }
@@ -236,6 +249,9 @@ func handlePlaceOrder(st *State, r *Request) Response {
 	hash := requestHash(body)
 	if entry, ok := st.Idempotency[key]; ok {
 		switch {
+		case entry.PendingAnswers > 0:
+			entry.PendingAnswers--
+			return Fail(http.StatusConflict, "IDEMPOTENCY_IN_PROGRESS", "Eine Anfrage mit diesem Idempotency-Key läuft noch.", nil)
 		case entry.InProgress:
 			return Fail(http.StatusConflict, "IDEMPOTENCY_IN_PROGRESS", "Eine Anfrage mit diesem Idempotency-Key läuft noch.", nil)
 		case entry.RequestHash != hash:
@@ -302,7 +318,8 @@ func handlePlaceOrder(st *State, r *Request) Response {
 	st.Orders[order.ID] = order
 
 	resp := Created(order.present(st, false))
-	st.Idempotency[key] = &IdempotencyEntry{RequestHash: hash, Response: resp}
+	st.Idempotency[key] = &IdempotencyEntry{RequestHash: hash, Response: resp, PendingAnswers: st.SlowOrderAnswers}
+	st.SlowOrderAnswers = 0
 	return resp
 }
 
