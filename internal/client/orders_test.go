@@ -171,6 +171,31 @@ func TestPlaceOrder_RetriesInjected5xxWithSameKey(t *testing.T) {
 	}
 }
 
+// The order is charged but the answer is lost on the way back: the client
+// retries with the same key and gets the replay — no second charge.
+func TestPlaceOrder_LostResponseIsReplayedNotChargedTwice(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	api.InjectResponse(http.MethodPost, "/orders", 1, testapi.DropAfterHandling())
+
+	order, err := newTestClient(api).PlaceOrder(context.Background(), client.OrderRequest{Items: []map[string]any{rootserverItem("web1")}}, 9.99, "tf-key-lost1")
+	if err != nil {
+		t.Fatalf("PlaceOrder: %v", err)
+	}
+	if !order.Replayed || len(order.Items) != 1 || order.Items[0].ResourceID == 0 {
+		t.Errorf("order = %+v, want replay", order)
+	}
+	if n := api.CallCount(http.MethodPost, "/orders"); n != 2 {
+		t.Errorf("calls = %d, want 2", n)
+	}
+	if api.ChargeCount() != 1 {
+		t.Errorf("charges = %d, want 1", api.ChargeCount())
+	}
+	if got := api.Balance(); got != 90.01 {
+		t.Errorf("balance = %v, want 90.01", got)
+	}
+}
+
 func TestQuote_IsNotRetried(t *testing.T) {
 	api := testapi.New(t)
 	api.InjectResponse(http.MethodPost, "/orders/quote", 1, testapi.Fail(http.StatusServiceUnavailable, "UNAVAILABLE", "down", nil))

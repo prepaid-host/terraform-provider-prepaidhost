@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -102,6 +103,19 @@ func parseOrder(r *Request, placing bool) (*orderBody, *Response) {
 	return &body, nil
 }
 
+// invalidField is OrderingException::invalid — one field in "field", unlike the
+// FormRequest validation which lists "fields".
+func invalidField(field, message string) Response {
+	return Fail(http.StatusUnprocessableEntity, "VALIDATION_FAILED", message, map[string]any{"field": field})
+}
+
+// domainName is sld + "." + tld, lower-cased like DomainConfigurator.
+func domainName(it map[string]any) string {
+	sld, _ := it["sld"].(string)
+	tld, _ := it["tld"].(string)
+	return strings.ToLower(sld) + "." + strings.ToLower(strings.TrimPrefix(tld, "."))
+}
+
 // reference is the item's client_reference, or the hostname for servers.
 func reference(it map[string]any) *string {
 	if ref, ok := it["client_reference"].(string); ok && ref != "" {
@@ -131,17 +145,24 @@ func (st *State) price(body *orderBody) (*pricing, *Response) {
 	for i, it := range body.Items {
 		typ, _ := it["type"].(string)
 		if typ == "domain" {
-			name, _ := it["name"].(string)
+			// DomainConfigurator: sld + tld are required; the API never takes a full "name".
+			for _, key := range []string{"sld", "tld"} {
+				if v, _ := it[key].(string); v == "" {
+					resp := invalidField(fmt.Sprintf("items.%d.%s", i, key), "The "+key+" field is required.")
+					return nil, &resp
+				}
+			}
+			name := domainName(it)
 			if st.UnavailableDomains[name] {
 				resp := Fail(http.StatusUnprocessableEntity, "DOMAIN_UNAVAILABLE", fmt.Sprintf("Die Domain %s ist nicht registrierbar.", name),
-					map[string]any{"field": fmt.Sprintf("items.%d.name", i), "domain": name})
+					map[string]any{"domain": name})
 				return nil, &resp
 			}
 		}
 		ref := reference(it)
 		if ref != nil {
 			if seen[*ref] {
-				resp := validationFailed(map[string][]string{fmt.Sprintf("items.%d.client_reference", i): {"Duplicate client_reference " + *ref + "."}})
+				resp := invalidField(fmt.Sprintf("items.%d.client_reference", i), "Duplicate client_reference "+*ref+".")
 				return nil, &resp
 			}
 			seen[*ref] = true
@@ -176,9 +197,9 @@ func handleQuote(st *State, r *Request) Response {
 		if it.typ != "domain" {
 			monthly = round2(it.total / float64(it.months))
 		}
-		name, _ := it.item["name"].(string)
-		if name == "" {
-			name, _ = it.item["hostname"].(string)
+		name, _ := it.item["hostname"].(string)
+		if it.typ == "domain" {
+			name = domainName(it.item)
 		}
 		items = append(items, map[string]any{
 			"type":            it.typ,
@@ -263,6 +284,9 @@ func handlePlaceOrder(st *State, r *Request) Response {
 		if it.reference != nil {
 			attrs["client_reference"] = *it.reference
 		}
+		if it.typ == "domain" {
+			attrs["name"] = domainName(it.item)
+		}
 		attrs["auto_renew"] = true
 		attrs["created_at"] = nowRFC3339()
 		attrs["expires_at"] = time.Now().AddDate(0, it.months, 0).UTC().Format(time.RFC3339)
@@ -277,7 +301,7 @@ func handlePlaceOrder(st *State, r *Request) Response {
 	st.Charges = append(st.Charges, Charge{OrderID: order.ID, Amount: p.total})
 	st.Orders[order.ID] = order
 
-	resp := Created(order.present(false))
+	resp := Created(order.present(st, false))
 	st.Idempotency[key] = &IdempotencyEntry{RequestHash: hash, Response: resp}
 	return resp
 }
@@ -296,7 +320,7 @@ func (st *State) referenceInUse(ref string) (string, int64, bool) {
 
 // present renders the order like OrderPlacementService::present. A poll
 // advances the simulated provisioning by one step.
-func (o *Order) present(poll bool) map[string]any {
+func (o *Order) present(st *State, poll bool) map[string]any {
 	status := "provisioning"
 	if o.pollsLeft <= 0 {
 		status = o.outcome
@@ -311,6 +335,10 @@ func (o *Order) present(poll bool) map[string]any {
 		s := status
 		if it.ForcedStatus != "" {
 			s = it.ForcedStatus
+		}
+		if _, exists := st.Resource(it.ResourceType, it.ResourceID); !exists {
+			// The API reports an item whose resource no longer exists as failed.
+			s = "failed"
 		}
 		if statusRank[s] > statusRank[overall] {
 			overall = s
@@ -341,7 +369,7 @@ func handleGetOrder(st *State, r *Request) Response {
 	if !ok {
 		return Fail(http.StatusNotFound, "ORDER_NOT_FOUND", "Bestellung nicht gefunden.", nil)
 	}
-	return OK(o.present(true))
+	return OK(o.present(st, true))
 }
 
 func handleBalance(st *State, _ *Request) Response {

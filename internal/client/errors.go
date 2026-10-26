@@ -39,6 +39,11 @@ type APIError struct {
 	Code    string
 	Message string
 	Extra   map[string]any
+
+	// Enveloped is true when the body was a valid API envelope
+	// ({"success":false,...}). False means the answer came from something else
+	// (proxy, wrong endpoint, HTML error page) and says nothing about resources.
+	Enveloped bool
 }
 
 // Error implements error.
@@ -103,18 +108,20 @@ func IsCode(err error, code string) bool {
 }
 
 // IsNotFound reports whether err means "this resource does not exist (any more)".
-// It covers HTTP 404, *_NOT_FOUND codes and the legacy endpoints that answer
-// with HTTP 200 and {"success":false,"result":"No Entrys available."} or
-// "... not found.".
+// Only answers of the API itself count (Enveloped): HTTP 404 with an envelope,
+// or the legacy endpoints' {"success":false,"result":"No Entrys available."} /
+// "... not found." at HTTP 200 or 404. An HTML 404 from a proxy or a wrong
+// endpoint, or "... not found." at another status (e.g. 422 "Template not
+// found."), is not — a Read must not drop state because of it.
 func IsNotFound(err error) bool {
 	apiErr, ok := AsAPIError(err)
-	if !ok {
+	if !ok || !apiErr.Enveloped {
 		return false
 	}
-	if apiErr.Status == 404 || strings.HasSuffix(apiErr.Code, "_NOT_FOUND") {
+	if apiErr.Status == 404 {
 		return true
 	}
-	if apiErr.Code != "" {
+	if apiErr.Status != 200 || apiErr.Code != "" {
 		return false
 	}
 	msg := strings.ToLower(apiErr.Message)

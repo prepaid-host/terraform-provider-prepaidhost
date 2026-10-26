@@ -77,7 +77,8 @@ type Response struct {
 	Body   any
 	Header http.Header
 
-	drop bool
+	drop         bool
+	afterHandler bool
 }
 
 type successEnvelope struct {
@@ -115,6 +116,11 @@ func Raw(status int, body any) Response { return Response{Status: status, Body: 
 
 // DropConnection closes the connection without an answer (a network error for the client).
 func DropConnection() Response { return Response{drop: true} }
+
+// DropAfterHandling, injected for a route, runs the real handler (state
+// changes such as a charge happen) and then closes the connection, so the
+// client never sees the answer — a response lost on the way back.
+func DropAfterHandling() Response { return Response{drop: true, afterHandler: true} }
 
 // WithHeader returns a copy of r with an added response header.
 func (r Response) WithHeader(key, value string) Response {
@@ -277,13 +283,12 @@ func (s *Server) dispatch(hr *http.Request, rt *route, path string, params map[s
 		return Fail(http.StatusUnauthorized, "UNAUTHENTICATED", "Unauthenticated.", nil)
 	}
 
-	if r, ok := s.takeInjected(hr.Method, path); ok {
-		return r
+	inj, injectedOK := s.takeInjected(hr.Method, path)
+	if !injectedOK && rt != nil {
+		inj, injectedOK = s.takeInjected(hr.Method, rt.pattern)
 	}
-	if rt != nil {
-		if r, ok := s.takeInjected(hr.Method, rt.pattern); ok {
-			return r
-		}
+	if injectedOK && !inj.afterHandler {
+		return inj
 	}
 
 	if rt == nil {
@@ -293,6 +298,9 @@ func (s *Server) dispatch(hr *http.Request, rt *route, path string, params map[s
 	defer func() {
 		if p := recover(); p != nil {
 			resp = Fail(http.StatusInternalServerError, "MOCK_PANIC", fmt.Sprint(p), nil)
+		}
+		if injectedOK && inj.afterHandler {
+			resp = DropConnection()
 		}
 	}()
 	return rt.handler(s.state, &Request{Request: hr, Path: path, Params: params, Body: body})

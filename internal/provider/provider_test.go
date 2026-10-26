@@ -170,6 +170,30 @@ func TestConfigure_InvalidEndpointIsDiagnostic(t *testing.T) {
 	}
 }
 
+func TestConfigure_PlainHTTPWarnsForRemoteHost(t *testing.T) {
+	t.Setenv(EnvToken, "")
+	cases := map[string]bool{
+		"http://api.example.test/api": true,
+		"http://127.0.0.1:8000/api":   false,
+		"http://localhost:8000/api":   false,
+		"http://[::1]:8000/api":       false,
+		"https://api.example.test":    false,
+	}
+	for ep, wantWarning := range cases {
+		resp := configure(t, ptr("t"), ptr(ep))
+		if resp.Diagnostics.HasError() {
+			t.Errorf("%s: unexpected error %v", ep, resp.Diagnostics)
+			continue
+		}
+		if got := resp.Diagnostics.WarningsCount() > 0; got != wantWarning {
+			t.Errorf("%s: warning = %v, want %v", ep, got, wantWarning)
+		}
+		if resp.ResourceData == nil {
+			t.Errorf("%s: warning must not block the client", ep)
+		}
+	}
+}
+
 // TestAccProvider_Loads checks that the CLI (OpenTofu or Terraform) can start
 // and configure the provider. Runs only with TF_ACC=1.
 func TestAccProvider_Loads(t *testing.T) {

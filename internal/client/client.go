@@ -25,6 +25,7 @@ const (
 	defaultPollInterval = 10 * time.Second
 	maxBackoff          = 30 * time.Second
 	maxErrorBodyLength  = 512
+	maxRedirects        = 10
 )
 
 // Client talks to the Prepaid-Host API with a Bearer token.
@@ -45,7 +46,11 @@ type Option func(*Client)
 func WithHTTPClient(hc *http.Client) Option {
 	return func(c *Client) {
 		if hc != nil {
-			c.httpClient = hc
+			cp := *hc
+			if cp.CheckRedirect == nil {
+				cp.CheckRedirect = checkRedirect
+			}
+			c.httpClient = &cp
 		}
 	}
 }
@@ -89,7 +94,7 @@ func New(endpoint, token string, opts ...Option) *Client {
 	c := &Client{
 		endpoint:     strings.TrimRight(endpoint, "/"),
 		token:        token,
-		httpClient:   &http.Client{Timeout: defaultTimeout},
+		httpClient:   &http.Client{Timeout: defaultTimeout, CheckRedirect: checkRedirect},
 		userAgent:    "terraform-provider-prepaidhost",
 		maxRetries:   defaultMaxRetries,
 		retryBackoff: defaultRetryBackoff,
@@ -99,6 +104,19 @@ func New(endpoint, token string, opts ...Option) *Client {
 		opt(c)
 	}
 	return c
+}
+
+// checkRedirect follows redirects only for GET. For writes Go would turn a
+// 301/302/303 into a GET and silently drop the body; instead the 3xx answer
+// is returned and reported as an error.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) > 0 && via[0].Method != http.MethodGet {
+		return http.ErrUseLastResponse
+	}
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	return nil
 }
 
 // Endpoint returns the API base URL without trailing slash.
@@ -188,6 +206,11 @@ func (c *Client) once(ctx context.Context, method, url string, payload []byte, o
 		return resp.Header, &transportError{err: fmt.Errorf("reading response: %w", err)}
 	}
 
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return resp.Header, fmt.Errorf("%s %s was redirected (HTTP %d to %q); redirects are not followed for writes — check the provider endpoint",
+			method, url, resp.StatusCode, resp.Header.Get("Location"))
+	}
+
 	return resp.Header, decode(resp.StatusCode, raw, out)
 }
 
@@ -220,7 +243,7 @@ func decode(status int, raw []byte, out any) error {
 }
 
 func envelopeError(status int, env envelope) *APIError {
-	apiErr := &APIError{Status: status}
+	apiErr := &APIError{Status: status, Enveloped: true}
 
 	var fields map[string]any
 	if len(env.Error) > 0 && json.Unmarshal(env.Error, &fields) == nil && fields != nil {

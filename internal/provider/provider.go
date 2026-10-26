@@ -6,8 +6,10 @@ package provider
 
 import (
 	"context"
+	"net"
 	"net/url"
 	"os"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -121,6 +123,9 @@ func (p *PrepaidHostProvider) Configure(ctx context.Context, req provider.Config
 	if u, err := url.Parse(endpoint); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Invalid Prepaid-Host API endpoint",
 			"The endpoint must be an http(s) URL such as "+DefaultEndpoint+", got \""+endpoint+"\".")
+	} else if u.Scheme == "http" && !isLoopback(u.Hostname()) {
+		resp.Diagnostics.AddAttributeWarning(path.Root("endpoint"), "Unencrypted Prepaid-Host API endpoint",
+			"The endpoint \""+endpoint+"\" uses plain http, so the API token is sent unencrypted. Use https.")
 	}
 	if resp.Diagnostics.HasError() {
 		return
@@ -140,4 +145,13 @@ func (p *PrepaidHostProvider) Resources(_ context.Context) []func() resource.Res
 // DataSources lists the data sources.
 func (p *PrepaidHostProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{}
+}
+
+// isLoopback reports whether host is localhost or a loopback IP (plain http is fine there).
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

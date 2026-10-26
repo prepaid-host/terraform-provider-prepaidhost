@@ -251,7 +251,7 @@ func TestPromoCode(t *testing.T) {
 	api.SetBalance(100)
 	api.SetPrice("domain", 10)
 	api.SetPromo("SAVE2", 2)
-	body := map[string]any{"items": []any{map[string]any{"type": "domain", "name": "example.de"}}, "promo_code": "SAVE2"}
+	body := map[string]any{"items": []any{map[string]any{"type": "domain", "sld": "example", "tld": "de"}}, "promo_code": "SAVE2"}
 
 	_, env := call(t, api, http.MethodPost, "/orders/quote", api.Token, body, nil)
 	var q struct {
@@ -283,10 +283,80 @@ func TestPromoCode(t *testing.T) {
 func TestDomainUnavailable(t *testing.T) {
 	api := testapi.New(t)
 	api.SetDomainUnavailable("taken.de")
-	body := map[string]any{"items": []any{map[string]any{"type": "domain", "name": "taken.de"}}}
+	body := map[string]any{"items": []any{map[string]any{"type": "domain", "sld": "Taken", "tld": "de"}}}
 	resp, env := call(t, api, http.MethodPost, "/orders/quote", api.Token, body, nil)
 	if resp.StatusCode != http.StatusUnprocessableEntity || env.Error["code"] != "DOMAIN_UNAVAILABLE" || env.Error["domain"] != "taken.de" {
 		t.Errorf("status=%d env=%+v", resp.StatusCode, env)
+	}
+	if _, ok := env.Error["field"]; ok {
+		t.Errorf("DOMAIN_UNAVAILABLE carries only domain, got %+v", env.Error)
+	}
+}
+
+func TestDomainRequiresSldAndTld(t *testing.T) {
+	api := testapi.New(t)
+	cases := map[string]struct {
+		item  map[string]any
+		field string
+	}{
+		"full name only": {map[string]any{"type": "domain", "name": "example.de"}, "items.0.sld"},
+		"no tld":         {map[string]any{"type": "domain", "sld": "example"}, "items.0.tld"},
+	}
+	for name, tc := range cases {
+		resp, env := call(t, api, http.MethodPost, "/orders/quote", api.Token, map[string]any{"items": []any{tc.item}}, nil)
+		if resp.StatusCode != http.StatusUnprocessableEntity || env.Error["code"] != "VALIDATION_FAILED" || env.Error["field"] != tc.field {
+			t.Errorf("%s: status=%d env=%+v", name, resp.StatusCode, env)
+		}
+	}
+}
+
+func TestDomainOrderStoresFullName(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	it := map[string]any{"type": "domain", "sld": "example", "tld": "de", "client_reference": "example.de"}
+	resp, _ := call(t, api, http.MethodPost, "/orders", api.Token, map[string]any{"items": []any{it}, "expected_total": 12.0}, map[string]string{"Idempotency-Key": "key-domain01"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	ids := api.ResourceIDs(testapi.ResourceDomain)
+	res, _ := api.Resource(testapi.ResourceDomain, ids[0])
+	if res["name"] != "example.de" || res["sld"] != "example" {
+		t.Errorf("resource = %v", res)
+	}
+}
+
+func TestGetOrder_ItemFailedWhenResourceGone(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	api.SetProvisioningPolls(0)
+	_, env := call(t, api, http.MethodPost, "/orders", api.Token, map[string]any{"items": []any{item("web1")}, "expected_total": 9.99}, map[string]string{"Idempotency-Key": "key-gone0001"})
+	var order struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(env.Result, &order)
+
+	api.DeleteResource(testapi.ResourceRootserver, api.ResourceIDs(testapi.ResourceRootserver)[0])
+	_, env = call(t, api, http.MethodGet, "/orders/"+order.ID, api.Token, nil, nil)
+	if !strings.Contains(string(env.Result), `"status":"failed"`) {
+		t.Errorf("result=%s", env.Result)
+	}
+}
+
+func TestDropAfterHandlingRunsHandler(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	api.InjectResponse(http.MethodPost, "/orders", 1, testapi.DropAfterHandling())
+
+	b, _ := json.Marshal(map[string]any{"items": []any{item("web1")}, "expected_total": 9.99})
+	req, _ := http.NewRequest(http.MethodPost, api.URL+"/orders", bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+api.Token)
+	req.Header.Set("Idempotency-Key", "key-drop0001")
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("want network error")
+	}
+	if api.ChargeCount() != 1 {
+		t.Errorf("handler must have run: charges = %d", api.ChargeCount())
 	}
 }
 
