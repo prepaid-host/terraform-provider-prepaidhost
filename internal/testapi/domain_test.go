@@ -25,7 +25,7 @@ func quoteError(t *testing.T, api *testapi.Server, it map[string]any) (int, map[
 	return resp.StatusCode, env.Error
 }
 
-// DomainConfigurator (API mode): the rules in their order, then the TLD,
+// API mode: the rules in their order, then the TLD,
 // then the availability of a register.
 func TestDomainOrderValidation(t *testing.T) {
 	api := testapi.New(t)

@@ -60,7 +60,7 @@ const (
 var rootserverMonths = map[int]int{30: 1, 90: 3, 180: 6, 365: 12}
 
 // orderResourceTypes maps an order item type to the resource type the API
-// creates for it (OrderItem.resource_type).
+// creates for it (the order item's resource_type).
 var orderResourceTypes = map[string]string{
 	"rootserver": "rootserver",
 	"rootpacket": "rootserver",

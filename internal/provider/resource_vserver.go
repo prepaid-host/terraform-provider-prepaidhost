@@ -63,7 +63,7 @@ const (
 	maxDisplayName = 32
 )
 
-// hostnamePattern is the API's hostname rule (ValidatesVserverInput).
+// hostnamePattern is the API's hostname rule.
 var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
 
 type vserverModel struct {

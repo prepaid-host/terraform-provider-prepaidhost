@@ -112,7 +112,7 @@ func invalidField(field, message string) Response {
 	return Fail(http.StatusUnprocessableEntity, "VALIDATION_FAILED", message, map[string]any{"field": field})
 }
 
-// domainName is sld + "." + tld like DomainConfigurator: only the sld is
+// domainName is sld + "." + tld like the API: only the sld is
 // lower-cased, the tld is taken as sent.
 func domainName(it map[string]any) string {
 	sld, _ := it["sld"].(string)
@@ -121,7 +121,7 @@ func domainName(it map[string]any) string {
 }
 
 // reference is the item's client_reference (for a domain always its name, as
-// DomainConfigurator sets it in API mode), or the hostname for servers.
+// the API sets it), or the hostname for servers.
 func reference(it map[string]any) *string {
 	if it["type"] == "domain" {
 		name := domainName(it)
@@ -152,7 +152,7 @@ func (st *State) price(body *orderBody) (*pricing, *Response) {
 	for i, it := range body.Items {
 		typ, _ := it["type"].(string)
 		if typ == "domain" {
-			// DomainConfigurator (API mode); the API never takes a full "name".
+			// API mode; the API never takes a full "name".
 			if errResp := st.validateDomainItem(i, it); errResp != nil {
 				return nil, errResp
 			}

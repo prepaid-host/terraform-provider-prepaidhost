@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,8 +43,17 @@ func testAccPreCheck(t *testing.T) {
 // (nil = attribute not set).
 func configure(t *testing.T, token, endpoint *string) *provider.ConfigureResponse {
 	t.Helper()
+	return configureWith(t, token, endpoint, nil)
+}
+
+func configureWith(t *testing.T, token, endpoint *string, rt http.RoundTripper) *provider.ConfigureResponse {
+	t.Helper()
 	ctx := context.Background()
-	p := New("test")()
+	var opts []client.Option
+	if rt != nil {
+		opts = append(opts, client.WithHTTPClient(&http.Client{Transport: rt}))
+	}
+	p := newWithClientOptions("test", opts...)()
 
 	var schemaResp provider.SchemaResponse
 	p.Schema(ctx, provider.SchemaRequest{}, &schemaResp)
@@ -115,7 +125,7 @@ func TestConfigure_EnvFallback(t *testing.T) {
 	t.Setenv(EnvToken, "env-token")
 	t.Setenv(EnvEndpoint, "https://staging.example.test/api")
 
-	resp := configure(t, nil, nil)
+	resp := configureWith(t, nil, nil, stubTransport{}) // never reach a real server
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("diags: %v", resp.Diagnostics)
 	}
@@ -140,10 +150,34 @@ func TestConfigure_DefaultEndpoint(t *testing.T) {
 	t.Setenv(EnvToken, "env-token")
 	t.Setenv(EnvEndpoint, "")
 
-	resp := configure(t, nil, nil)
-	c := resp.ResourceData.(*client.Client) //nolint:forcetypeassert // test
+	resp := configureWith(t, nil, nil, stubTransport{}) // never reach a real server
+	c := resp.ResourceData.(*client.Client)             //nolint:forcetypeassert // test
 	if c.Endpoint() != DefaultEndpoint || DefaultEndpoint != "https://prepaid-host.com/api" {
 		t.Errorf("endpoint = %q", c.Endpoint())
+	}
+}
+
+func TestConfigure_MethodNotAllowedIsWrongEndpoint(t *testing.T) {
+	t.Setenv(EnvToken, "")
+	t.Setenv(EnvEndpoint, "")
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, `{"success":false,"error":{"code":"METHOD_NOT_ALLOWED","message":"x"}}`)
+	}))
+	defer srv.Close()
+
+	resp := configureWith(t, ptr("t"), ptr(srv.URL+"/api"), http.DefaultTransport)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("want endpoint diagnostic")
+	}
+	if got := resp.Diagnostics.Errors()[0].Summary(); !strings.Contains(got, "endpoint looks wrong") {
+		t.Errorf("summary = %q", got)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("calls = %d, want 1", calls.Load())
 	}
 }
 
@@ -184,7 +218,7 @@ func TestConfigure_PlainHTTPWarnsForRemoteHost(t *testing.T) {
 		"https://api.example.test":    false,
 	}
 	for ep, wantWarning := range cases {
-		resp := configure(t, ptr("t"), ptr(ep))
+		resp := configureWith(t, ptr("t"), ptr(ep), stubTransport{})
 		if resp.Diagnostics.HasError() {
 			t.Errorf("%s: unexpected error %v", ep, resp.Diagnostics)
 			continue
@@ -257,4 +291,16 @@ output "ok" {
 			},
 		},
 	})
+}
+
+// stubTransport answers every request with an empty success envelope.
+type stubTransport struct{}
+
+func (stubTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"success":true,"result":{}}`)),
+		Request:    r,
+	}, nil
 }

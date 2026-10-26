@@ -199,7 +199,8 @@ var ErrNotTheAPI = errors.New("the endpoint does not answer like the Prepaid-Hos
 
 // CheckEndpoint sends GET /catalog once, without retries, and returns an error
 // wrapping ErrNotTheAPI when the answer shows that the endpoint is not the
-// API: HTTP 404 (no such route, or an HTML error page) or a success answer
+// API: HTTP 404 (no such route, or an HTML error page), HTTP 405 (older
+// servers answer unknown /api routes with a method-not-allowed catch-all) or a success answer
 // without the API envelope (a web page). Every other outcome — success, a
 // rejected token, the rate limit, a server or network error — returns nil:
 // the endpoint may be right, and the real calls report such failures
@@ -210,7 +211,7 @@ func (c *Client) CheckEndpoint(ctx context.Context) error {
 		return nil
 	}
 	if apiErr, ok := AsAPIError(err); ok {
-		if apiErr.Status == http.StatusNotFound {
+		if apiErr.Status == http.StatusNotFound || apiErr.Status == http.StatusMethodNotAllowed {
 			return fmt.Errorf("%w: GET %s/catalog answered %v", ErrNotTheAPI, c.endpoint, err)
 		}
 		return nil

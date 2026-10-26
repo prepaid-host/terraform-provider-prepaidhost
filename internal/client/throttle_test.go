@@ -222,6 +222,8 @@ func TestCheckEndpoint(t *testing.T) {
 		"HTML page":            {200, "<html><body>Welcome</body></html>", true},
 		"HTML 404":             {404, "<html>404</html>", true},
 		"enveloped 404":        {404, `{"success":false,"error":{"code":"NOT_FOUND","message":"Endpoint nicht gefunden."}}`, true},
+		"HTML 405":             {405, "<html>405</html>", true},
+		"enveloped 405":        {405, `{"success":false,"error":{"code":"METHOD_NOT_ALLOWED","message":"x"}}`, true},
 		"server error":         {500, `{"success":false,"error":{"code":"INTERNAL_ERROR","message":"x"}}`, false},
 		"rate limit":           {429, `{"success":false,"error":{"code":"TOO_MANY_REQUESTS","message":"x"}}`, false},
 		"unauthenticated JSON": {401, `{"success":false,"error":{"code":"UNAUTHENTICATED","message":"x"}}`, false},

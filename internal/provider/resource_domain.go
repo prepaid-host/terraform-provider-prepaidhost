@@ -89,7 +89,7 @@ func (m *domainModel) purchaseValues() map[string]attr.Value {
 }
 
 // splitDomainName splits a validated name into sld and TLD. The sld is a
-// single label (DomainConfigurator: max 63, the panel's single-label rule),
+// single label (max 63, the panel's single-label rule),
 // so everything after the first dot is the TLD — "shop.co.uk" is shop + co.uk.
 // A sub-domain such as "www.example.de" therefore asks for the TLD
 // "example.de", which the catalog does not have: the price quote refuses it
