@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -306,33 +307,41 @@ func TestAccVserver_PacketChangeIsAPlanError(t *testing.T) {
 }
 
 // Non-purchase arguments change in place without a purchase.
-func TestAccVserver_HostnameAndAutoRenewUpdate(t *testing.T) {
+func TestAccVserver_DisplayNameAndAutoRenewUpdate(t *testing.T) {
 	api := vserverAPI(t)
 	var id string
+	var orders int
 	accTest(t,
 		tfresource.TestStep{
 			Config: vserverConfig(api, nil),
-			Check: tfresource.TestCheckResourceAttrWith(vserverAddr, "id", func(v string) error {
-				id = v
-				return nil
-			}),
+			Check: tfresource.ComposeAggregateTestCheckFunc(
+				tfresource.TestCheckResourceAttr(vserverAddr, "display_name", "web1"),
+				tfresource.TestCheckResourceAttrWith(vserverAddr, "id", func(v string) error {
+					id = v
+					orders = api.CallCount(http.MethodPost, "/orders")
+					return nil
+				}),
+			),
 		},
 		tfresource.TestStep{
-			Config: vserverConfig(api, map[string]string{"hostname": `"web-frankfurt"`}),
+			Config: vserverConfig(api, map[string]string{"display_name": `"Webserver Frankfurt"`}),
 			Check: tfresource.ComposeAggregateTestCheckFunc(
-				tfresource.TestCheckResourceAttr(vserverAddr, "hostname", "web-frankfurt"),
+				tfresource.TestCheckResourceAttr(vserverAddr, "display_name", "Webserver Frankfurt"),
 				tfresource.TestCheckResourceAttrPtr(vserverAddr, "id", &id),
 				wantCharges(api, 1),
 				checkMock(func() error {
-					if got := serverAttr(api, serverID(t, api), "display_name"); got != "web-frankfurt" {
+					if got := serverAttr(api, serverID(t, api), "display_name"); got != "Webserver Frankfurt" {
 						return fmt.Errorf("display_name = %v", got)
+					}
+					if n := api.CallCount(http.MethodPost, "/orders"); n != orders {
+						return fmt.Errorf("POST /orders %d → %d: a rename must not order", orders, n)
 					}
 					return nil
 				}),
 			),
 		},
 		tfresource.TestStep{
-			Config: vserverConfig(api, map[string]string{"hostname": `"web-frankfurt"`, "auto_renew": "false"}),
+			Config: vserverConfig(api, map[string]string{"display_name": `"Webserver Frankfurt"`, "auto_renew": "false"}),
 			Check: tfresource.ComposeAggregateTestCheckFunc(
 				tfresource.TestCheckResourceAttr(vserverAddr, "auto_renew", "false"),
 				checkMock(func() error {
@@ -344,7 +353,7 @@ func TestAccVserver_HostnameAndAutoRenewUpdate(t *testing.T) {
 			),
 		},
 		tfresource.TestStep{
-			Config: vserverConfig(api, map[string]string{"hostname": `"web-frankfurt"`, "auto_renew": "true",
+			Config: vserverConfig(api, map[string]string{"display_name": `"Webserver Frankfurt"`, "auto_renew": "true",
 				"promo_code": `"LATER"`, "max_price": "50", "ssh_key_ids": "[7]", "password": `"other-pass"`, "create_timeout": `"45m"`}),
 			Check: tfresource.ComposeAggregateTestCheckFunc(
 				tfresource.TestCheckResourceAttr(vserverAddr, "auto_renew", "true"),
@@ -357,15 +366,45 @@ func TestAccVserver_HostnameAndAutoRenewUpdate(t *testing.T) {
 				}),
 			),
 		},
-		// Too short for the panel's display name (4–32): refused at plan.
+		// The panel takes 4–32 characters.
 		tfresource.TestStep{
-			Config:      vserverConfig(api, map[string]string{"hostname": `"web"`}),
-			ExpectError: re(`(?s)hostname.*4 to 32`),
+			Config:      vserverConfig(api, map[string]string{"display_name": `"web"`}),
+			ExpectError: re(`(?s)display_name.*4 and 32`),
+		},
+		tfresource.TestStep{
+			Config: vserverConfig(api, map[string]string{"display_name": `"Webserver Frankfurt"`, "auto_renew": "true",
+				"promo_code": `"LATER"`, "max_price": "50", "ssh_key_ids": "[7]", "password": `"other-pass"`, "create_timeout": `"45m"`}),
+			PlanOnly: true,
 		},
 	)
 	if n := api.CallCount(http.MethodPut, "/rootserver/{id}/display-name"); n != 1 {
 		t.Errorf("display-name PUTs = %d, want 1", n)
 	}
+}
+
+// hostname is the client reference: renaming it is a plan error, no writes.
+func TestAccVserver_HostnameChangeIsAPlanError(t *testing.T) {
+	api := vserverAPI(t)
+	var writes int
+	accTest(t,
+		tfresource.TestStep{
+			Config: vserverConfig(api, nil),
+			Check:  checkMock(func() error { writes = api.WriteCount(); return nil }),
+		},
+		tfresource.TestStep{
+			Config:      vserverConfig(api, map[string]string{"hostname": `"web-frankfurt"`}),
+			ExpectError: re(`(?s)Purchase arguments cannot be changed.*hostname.*identifies the purchased server.*display_name`),
+		},
+		tfresource.TestStep{
+			PreConfig: func() {
+				if api.WriteCount() != writes {
+					t.Errorf("writes %d → %d", writes, api.WriteCount())
+				}
+			},
+			Config:   vserverConfig(api, nil),
+			PlanOnly: true,
+		},
+	)
 }
 
 // Destroy cancels: auto-renew off, the server stays until expires_at.
@@ -492,7 +531,7 @@ func TestAccVserver_AdoptedServerNotInstalledInTime(t *testing.T) {
 	accTest(t,
 		tfresource.TestStep{
 			Config:      vserverConfig(api, map[string]string{"create_timeout": `"1s"`}),
-			ExpectError: re(`(?s)not installed.*` + strconv.FormatInt(existing, 10)),
+			ExpectError: re(`(?s)vServer ` + strconv.FormatInt(existing, 10) + ` was taken over, but it is not installed.*will not be bought twice`),
 		},
 		tfresource.TestStep{
 			PreConfig: func() { api.SetInstallAfterReads(existing, 0) },
@@ -522,36 +561,54 @@ func TestAccVserver_AdoptionOfDifferentServerIsRefused(t *testing.T) {
 	}
 }
 
-// Review Focus 5: cancelled (gone) or expired outside Terraform → removed
-// from the state, the plan proposes a new server, no crash.
-func TestAccVserver_GoneOrExpiredIsRemovedFromState(t *testing.T) {
-	for name, outside := range map[string]func(api *testapi.Server, id int64){
-		"deleted": func(api *testapi.Server, id int64) { api.DeleteResource(testapi.ResourceRootserver, id) },
-		"expired": func(api *testapi.Server, id int64) {
-			api.UpdateResource(testapi.ResourceRootserver, id, func(a map[string]any) {
-				a["expires_at"] = time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
-			})
+// Review Focus 5: deleted outside Terraform → removed from the state, the
+// plan proposes a new server, no crash.
+func TestAccVserver_DeletedIsRemovedFromState(t *testing.T) {
+	api := vserverAPI(t)
+	accTest(t,
+		tfresource.TestStep{Config: vserverConfig(api, nil)},
+		tfresource.TestStep{
+			PreConfig:          func() { api.DeleteResource(testapi.ResourceRootserver, serverID(t, api)) },
+			RefreshState:       true,
+			ExpectNonEmptyPlan: true,
+			Check: func(s *terraform.State) error {
+				if rs := s.RootModule().Resources[vserverAddr]; rs != nil {
+					return fmt.Errorf("still in state: %v", rs.Primary.ID)
+				}
+				return nil
+			},
 		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			api := vserverAPI(t)
-			accTest(t,
-				tfresource.TestStep{Config: vserverConfig(api, nil)},
-				tfresource.TestStep{
-					PreConfig:          func() { outside(api, serverID(t, api)) },
-					RefreshState:       true,
-					ExpectNonEmptyPlan: true,
-					Check: func(s *terraform.State) error {
-						if rs := s.RootModule().Resources[vserverAddr]; rs != nil {
-							return fmt.Errorf("still in state: %v", rs.Primary.ID)
-						}
-						return nil
-					},
-				},
-				tfresource.TestStep{Config: vserverConfig(api, nil), PlanOnly: true, ExpectNonEmptyPlan: true},
-			)
-		})
-	}
+		tfresource.TestStep{Config: vserverConfig(api, nil), PlanOnly: true, ExpectNonEmptyPlan: true},
+	)
+}
+
+// Review Focus 5 (fix round 1): expired but still listed by the API → stays
+// in the state as "expired" (the platform may still renew it), and the next
+// apply buys nothing.
+func TestAccVserver_ExpiredStaysInStateWithoutPurchase(t *testing.T) {
+	api := vserverAPI(t)
+	accTest(t,
+		tfresource.TestStep{Config: vserverConfig(api, nil)},
+		tfresource.TestStep{
+			PreConfig: func() {
+				api.UpdateResource(testapi.ResourceRootserver, serverID(t, api), func(a map[string]any) {
+					a["expires_at"] = time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+				})
+			},
+			Config: vserverConfig(api, nil),
+			Check: tfresource.ComposeAggregateTestCheckFunc(
+				tfresource.TestCheckResourceAttr(vserverAddr, "status", "expired"),
+				wantCharges(api, 1),
+				checkMock(func() error {
+					if n := api.CallCount(http.MethodPost, "/orders"); n != 1 {
+						return fmt.Errorf("POST /orders = %d, want 1", n)
+					}
+					return nil
+				}),
+			),
+		},
+		tfresource.TestStep{Config: vserverConfig(api, nil), PlanOnly: true},
+	)
 }
 
 func TestAccVserver_InsufficientBalance(t *testing.T) {
@@ -594,14 +651,14 @@ func TestAccVserver_Import(t *testing.T) {
 			ImportState:       true,
 			ImportStateVerify: true,
 			// Not readable from the API (only used for the purchase, or write-only).
-			ImportStateVerifyIgnore: []string{"hostname", "traffic", "duration_days", "ssh_key_ids", "password",
+			ImportStateVerifyIgnore: []string{"hostname", "display_name", "traffic", "duration_days", "ssh_key_ids", "password",
 				"promo_code", "max_price", "create_timeout"},
 		},
 	)
 }
 
-// A server bought outside Terraform is imported; the first apply only sets
-// the display name from hostname (no purchase).
+// A server bought outside Terraform is imported; the first apply takes the
+// configured hostname as is (no purchase, no rename).
 func TestAccVserver_ImportExisting(t *testing.T) {
 	api := vserverAPI(t)
 	existing := api.SeedRootserver(map[string]any{"display_name": "old-name"})
@@ -628,7 +685,7 @@ func TestAccVserver_ImportExisting(t *testing.T) {
 				tfresource.TestCheckResourceAttr(vserverAddr, "id", id),
 				wantCharges(api, 0),
 				checkMock(func() error {
-					if got := serverAttr(api, existing, "display_name"); got != "web1" {
+					if got := serverAttr(api, existing, "display_name"); got != "old-name" {
 						return fmt.Errorf("display_name = %v", got)
 					}
 					return nil
@@ -769,20 +826,87 @@ func TestVserver_NewOrderDoesNotWarn(t *testing.T) {
 	}
 }
 
-func TestVserver_ReadExpiredWarns(t *testing.T) {
-	api := vserverAPI(t)
-	id := api.SeedRootserver(map[string]any{"expires_at": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)})
+func readDirect(t *testing.T, api *testapi.Server, id int64, set map[string]tftypes.Value) resource.ReadResponse {
+	t.Helper()
 	sch := vserverSchema(t)
 	vals := customValues()
 	vals["id"] = str(strconv.FormatInt(id, 10))
+	for k, v := range set {
+		vals[k] = v
+	}
 	state := tfsdk.State{Schema: sch.Schema, Raw: tfValue(t, sch, vals, true)}
 	resp := resource.ReadResponse{State: state}
 	testVserverResource(api).Read(context.Background(), resource.ReadRequest{State: state}, &resp)
-	if resp.Diagnostics.HasError() || !resp.State.Raw.IsNull() {
-		t.Fatalf("want removal without error, got %v (state null: %v)", resp.Diagnostics, resp.State.Raw.IsNull())
+	return resp
+}
+
+func stateString(t *testing.T, resp resource.ReadResponse, name string) string {
+	t.Helper()
+	var v types.String
+	resp.State.GetAttribute(context.Background(), path.Root(name), &v)
+	return v.ValueString()
+}
+
+func TestVserver_ReadExpiredWarnsAndKeeps(t *testing.T) {
+	api := vserverAPI(t)
+	id := api.SeedRootserver(map[string]any{"expires_at": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)})
+	resp := readDirect(t, api, id, nil)
+	if resp.Diagnostics.HasError() || resp.State.Raw.IsNull() {
+		t.Fatalf("want the server kept, got %v (state null: %v)", resp.Diagnostics, resp.State.Raw.IsNull())
 	}
-	if w := resp.Diagnostics.Warnings(); len(w) != 1 || !strings.Contains(w[0].Detail(), "expired") {
+	if got := stateString(t, resp, "status"); got != "expired" {
+		t.Errorf("status = %q", got)
+	}
+	if w := resp.Diagnostics.Warnings(); len(w) != 1 || !strings.Contains(w[0].Detail(), "expired on") ||
+		!strings.Contains(w[0].Detail(), "destroy it to stop renewal") {
 		t.Errorf("want an expiry warning, got %v", resp.Diagnostics)
+	}
+}
+
+// Minor 3: renew is owner-only; a 404 there while show and rental answer
+// means shared access, not "gone".
+func TestVserver_ReadRenewNotFoundIsNotTheOwner(t *testing.T) {
+	api := vserverAPI(t)
+	id := api.SeedRootserver(nil)
+	api.InjectResponse(http.MethodGet, "/rootserver/{id}/renew", 1,
+		testapi.Fail(http.StatusNotFound, "NOT_FOUND", "Endpoint nicht gefunden.", nil))
+	resp := readDirect(t, api, id, nil)
+	if !resp.Diagnostics.HasError() || !strings.Contains(errorText(resp.Diagnostics), "not its owner") {
+		t.Fatalf("want the owner error, got %v", resp.Diagnostics)
+	}
+	if resp.State.Raw.IsNull() {
+		t.Errorf("a shared server must not be removed from the state")
+	}
+}
+
+// Minor 4: the renewal info fails on its own → warning, last value kept.
+func TestVserver_ReadRenewFailureKeepsAutoRenew(t *testing.T) {
+	api := vserverAPI(t)
+	id := api.SeedRootserver(map[string]any{"auto_renew": true})
+	api.InjectResponse(http.MethodGet, "/rootserver/{id}/renew", 1,
+		testapi.Fail(http.StatusUnprocessableEntity, "PRICE_UNAVAILABLE", "Preis nicht verfügbar.", nil))
+	resp := readDirect(t, api, id, map[string]tftypes.Value{"auto_renew": tftypes.NewValue(tftypes.Bool, false)})
+	if resp.Diagnostics.HasError() {
+		t.Fatal(resp.Diagnostics)
+	}
+	var auto types.Bool
+	resp.State.GetAttribute(context.Background(), path.Root("auto_renew"), &auto)
+	if auto.ValueBool() {
+		t.Errorf("auto_renew = true, want the last known false")
+	}
+	if w := resp.Diagnostics.Warnings(); len(w) != 1 || !strings.Contains(w[0].Detail(), "PRICE_UNAVAILABLE") {
+		t.Errorf("want the warning, got %v", resp.Diagnostics)
+	}
+}
+
+func TestVserver_DestroyOfExpiredServerSaysSo(t *testing.T) {
+	text := cancelText("1001", types.StringValue("2020-01-02T03:04:05Z"), "Cancelling")
+	if !strings.Contains(text, "already expired") || strings.Contains(text, "takes it over") {
+		t.Errorf("text = %q", text)
+	}
+	text = cancelText("1001", types.StringValue("2099-01-02T03:04:05Z"), "Cancelling")
+	if !strings.Contains(text, "same hostname") || !strings.Contains(text, "2099-01-02") {
+		t.Errorf("text = %q", text)
 	}
 }
 
@@ -820,9 +944,7 @@ func modifyPlanDirect(t *testing.T, state, plan map[string]tftypes.Value) resour
 	return resp
 }
 
-// A renamed server keeps its order's client reference: the plan says what
-// that means for destroy + apply.
-func TestVserver_HostnameChangeWarnsAboutClientReference(t *testing.T) {
+func TestVserver_HostnameChangeIsRefusedAtPlan(t *testing.T) {
 	state := customValues()
 	state["id"] = str("1001")
 	plan := customValues()
@@ -830,12 +952,20 @@ func TestVserver_HostnameChangeWarnsAboutClientReference(t *testing.T) {
 	plan["hostname"] = str("web-frankfurt")
 
 	resp := modifyPlanDirect(t, state, plan)
-	if resp.Diagnostics.HasError() {
-		t.Fatal(resp.Diagnostics)
+	if !strings.Contains(errorText(resp.Diagnostics), "identifies the purchased server") {
+		t.Errorf("want the hostname plan error, got %v", resp.Diagnostics)
 	}
-	w := resp.Diagnostics.Warnings()
-	if len(w) != 1 || !strings.Contains(w[0].Detail(), `client reference "web1"`) || !strings.Contains(w[0].Detail(), "buys a new one") {
-		t.Errorf("want the client reference warning, got %v", resp.Diagnostics)
+}
+
+// After an import the hostname is unknown: the configured one is taken.
+func TestVserver_HostnameAfterImportIsTaken(t *testing.T) {
+	state := customValues()
+	state["id"] = str("1001")
+	delete(state, "hostname")
+	plan := customValues()
+	plan["id"] = str("1001")
+	if resp := modifyPlanDirect(t, state, plan); resp.Diagnostics.HasError() || len(resp.Diagnostics.Warnings()) != 0 {
+		t.Errorf("want no diagnostics, got %v", resp.Diagnostics)
 	}
 }
 

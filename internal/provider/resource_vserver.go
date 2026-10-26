@@ -52,6 +52,10 @@ type vserverResource struct {
 const (
 	statusActive     = "active"
 	statusInstalling = "installing"
+	statusExpired    = "expired"
+	// minPostPurchase is the time the reads after a paid order get at least,
+	// even when create_timeout is (nearly) used up.
+	minPostPurchase = 30 * time.Second
 	// Display names the panel accepts (RootserverController::updateDisplayName).
 	minDisplayName = 4
 	maxDisplayName = 32
@@ -61,8 +65,9 @@ const (
 var hostnamePattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
 
 type vserverModel struct {
-	ID       types.String `tfsdk:"id"`
-	Hostname types.String `tfsdk:"hostname"`
+	ID          types.String `tfsdk:"id"`
+	Hostname    types.String `tfsdk:"hostname"`
+	DisplayName types.String `tfsdk:"display_name"`
 
 	PacketID        types.Int64  `tfsdk:"packet_id"`
 	DurationMonths  types.Int64  `tfsdk:"duration_months"`
@@ -92,13 +97,16 @@ type vserverModel struct {
 // purchaseAttributes decide what was bought. They are never changed in place
 // and never replace the server (that would buy a new one silently): a change
 // is a plan error (see ModifyPlan).
+//
+// hostname belongs here too: it is the order's client reference and part of
+// the Idempotency-Key, so it identifies the purchased server.
 var purchaseAttributes = []string{
-	"packet_id", "duration_months", "cores", "memory", "disk", "addresses", "backups", "traffic", "duration_days", "template_id",
+	"hostname", "packet_id", "duration_months", "cores", "memory", "disk", "addresses", "backups", "traffic", "duration_days", "template_id",
 }
 
 func (m *vserverModel) purchaseValues() map[string]attr.Value {
 	return map[string]attr.Value{
-		"packet_id": m.PacketID, "duration_months": m.DurationMonths,
+		"hostname": m.Hostname, "packet_id": m.PacketID, "duration_months": m.DurationMonths,
 		"cores": m.Cores, "memory": m.Memory, "disk": m.Disk, "addresses": m.Addresses, "backups": m.Backups,
 		"traffic": m.Traffic, "duration_days": m.DurationDays, "template_id": m.TemplateID,
 	}
@@ -184,11 +192,19 @@ func (r *vserverResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			"`hostname` is taken over instead of buying a second one (with a warning, and auto-renew switched on again).\n\n" +
 			"**Destroying the resource cancels, it does not delete:** auto-renew is switched off and the server keeps " +
 			"running until `expires_at`. There is no refund for the remaining term. Applying the same configuration " +
-			"before that date takes the server over again without a new purchase.\n\n" +
-			"The purchase arguments (`packet_id`, `duration_months`, `cores`, `memory`, `disk`, `addresses`, `backups`, " +
-			"`traffic`, `duration_days`, `template_id`) are never changed in place and never replace the server: a " +
-			"change is a plan error. Only `hostname` (display name) and `auto_renew` are updated in place.\n\n" +
-			"A server cancelled or expired outside Terraform is removed from the state; the next apply buys a new one.\n\n" +
+			"(same `hostname`) before that date takes the server over again without a new purchase.\n\n" +
+			"The purchase arguments (`hostname`, `packet_id`, `duration_months`, `cores`, `memory`, `disk`, `addresses`, " +
+			"`backups`, `traffic`, `duration_days`, `template_id`) are never changed in place and never replace the server: " +
+			"a change is a plan error. Only `display_name` and `auto_renew` are updated in place.\n\n" +
+			"A server deleted outside Terraform is removed from the state; the next apply buys a new one. A server whose " +
+			"term expired stays in the state with `status = \"expired\"` as long as the API still lists it: with auto-renew " +
+			"on, the platform may still renew it for about a day after expiry, and it is deleted a few days later. Renew it " +
+			"in the panel, or destroy it to stop renewal.\n\n" +
+			"`create_before_destroy` or `taint` with an unchanged configuration takes the same server over again (no " +
+			"purchase); the delete of the deposed object then switches auto-renew off, which the next plan shows as a " +
+			"one-time change of `auto_renew` from false to true.\n\n" +
+			"Rarely, a server whose rental record was removed on the platform makes reads fail with HTTP 500; remove it " +
+			"with `terraform state rm` then.\n\n" +
 			"Needs a token with the scopes `orders:write` (ordering), `rootserver:read`, `rootserver:network:read` " +
 			"(addresses) and `rootserver:renew` (auto-renew).",
 		Attributes: map[string]schema.Attribute{
@@ -198,16 +214,24 @@ func (r *vserverResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"hostname": schema.StringAttribute{
-				MarkdownDescription: "Hostname of the server (1–63 letters, digits and hyphens, no dots). It is also the " +
-					"order's client reference: while a live server carries it, ordering the same hostname takes that server " +
-					"over instead of buying another. Changing it later only renames the server in the panel (display name, " +
-					"4–32 characters); the client reference of the order stays the original hostname. " +
-					"The API cannot read it back, so after `terraform import` the first apply sets the display name.",
+				MarkdownDescription: purchaseNote("Hostname of the server (1–63 letters, digits and hyphens, no dots). It is " +
+					"the order's client reference and part of its Idempotency-Key, so it identifies the purchased server: while a " +
+					"live server carries it, ordering the same hostname takes that server over instead of buying another. " +
+					"To rename the server in the panel use `display_name`. The API cannot read it back; after `terraform import` " +
+					"the configured value is taken as is."),
 				Required: true,
 				Validators: []validator.String{
 					stringvalidator.LengthBetween(1, 63),
 					stringvalidator.RegexMatches(hostnamePattern, "must consist of letters, digits and inner hyphens"),
 				},
+			},
+			"display_name": schema.StringAttribute{
+				MarkdownDescription: "Name of the server in the panel (4–32 characters). Defaults to `hostname` when the server " +
+					"is bought; changed in place. The API cannot read it back.",
+				Optional:      true,
+				Computed:      true,
+				Validators:    []validator.String{stringvalidator.LengthBetween(minDisplayName, maxDisplayName)},
+				PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
 			"packet_id": schema.Int64Attribute{
 				MarkdownDescription: purchaseNote("Root packet to buy (`prepaidhost_catalog` type `rootpacket`). Conflicts with the custom arguments."),
@@ -317,7 +341,7 @@ func (r *vserverResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				PlanModifiers:       []planmodifier.List{listplanmodifier.UseStateForUnknown()},
 			},
 			"status": schema.StringAttribute{
-				MarkdownDescription: "`active` when installed, `installing` otherwise (e.g. during a reinstall).",
+				MarkdownDescription: "`active` when installed, `installing` otherwise (e.g. during a reinstall), `expired` when the term ran out.",
 				Computed:            true,
 				PlanModifiers:       []planmodifier.String{stringplanmodifier.UseStateForUnknown()},
 			},
@@ -592,16 +616,35 @@ func (r *vserverResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 	id := strconv.FormatInt(resourceID, 10)
+	existed := outcome != orderNew
 
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	// From here on the server is paid (or taken over): every error says so.
+	// The installation wait ends at the deadline; the reads around it get at
+	// least minPostPurchase, so a create_timeout used up by the order does
+	// not turn a paid purchase into a confusing read error.
+	paidError := func(summary, problem string, err error) {
+		what := "is already paid"
+		if outcome == orderReferenceInUse {
+			what = "was taken over"
+		}
+		detail := fmt.Sprintf("vServer %s %s, but %s. Run apply again without changing hostname or the purchase "+
+			"arguments — it will not be bought twice.", id, what, problem)
+		if err != nil {
+			detail += "\n\n" + describeError(err)
+		}
+		resp.Diagnostics.AddError(summary, detail)
+	}
+	postCtx := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(ctx, max(time.Until(deadline), minPostPurchase))
+	}
+
+	rctx, cancel := postCtx()
 	defer cancel()
-
-	s, err := r.show(ctx, id)
+	s, err := r.show(rctx, id)
 	if err != nil {
-		addAPIError(&resp.Diagnostics, "Could not read the vServer", err)
+		paidError("Could not read the vServer", "it could not be read", err)
 		return
 	}
-	existed := outcome != orderNew
 	if existed {
 		// A server that existed before this apply: it must be the configured one.
 		if diff := plan.mismatch(s); len(diff) > 0 {
@@ -617,9 +660,8 @@ func (r *vserverResource) Create(ctx context.Context, req resource.CreateRequest
 	// off (destroy switched it off).
 	wantRenew := plan.AutoRenew.ValueBool()
 	if existed || !wantRenew {
-		if err := r.setAutoRenew(ctx, id, wantRenew); err != nil {
-			addAPIError(&resp.Diagnostics, "Could not set auto-renew of the vServer",
-				fmt.Errorf("vServer %s: %w. Nothing is bought again: run apply again to take it over", id, err))
+		if err := r.setAutoRenew(rctx, id, wantRenew); err != nil {
+			paidError("Could not set auto-renew of the vServer", "auto-renew could not be set", err)
 			return
 		}
 	}
@@ -631,19 +673,33 @@ func (r *vserverResource) Create(ctx context.Context, req resource.CreateRequest
 	}
 
 	if !s.Installed {
-		s, err = r.waitInstalled(ctx, id)
+		wctx, cancelWait := context.WithDeadline(ctx, deadline)
+		s, err = r.waitInstalled(wctx, id)
+		cancelWait()
 		if err != nil {
-			detail := fmt.Sprintf("vServer %s is not installed after %s. Nothing is bought again: run apply again to take it "+
-				"over and wait for it (raise create_timeout if the installation takes longer).\n\n%s", id, timeout, describeError(err))
-			resp.Diagnostics.AddError("vServer not installed", detail)
+			paidError("vServer not installed",
+				fmt.Sprintf("it is not installed after %s (raise create_timeout if the installation takes longer)", timeout), err)
+			return
+		}
+	}
+
+	fctx, cancelFill := postCtx()
+	defer cancelFill()
+	// The fulfiller names the server after the hostname; a configured
+	// display_name is set on top.
+	if plan.DisplayName.IsUnknown() || plan.DisplayName.IsNull() {
+		plan.DisplayName = types.StringValue(hostname)
+	} else if plan.DisplayName.ValueString() != hostname || existed {
+		if err := r.setDisplayName(fctx, id, plan.DisplayName.ValueString()); err != nil {
+			paidError("Could not set the display name", "its display name could not be set", err)
 			return
 		}
 	}
 
 	plan.ID = types.StringValue(id)
 	plan.applyShow(s)
-	if err := r.fillComputed(ctx, &plan); err != nil {
-		addAPIError(&resp.Diagnostics, "Could not read the vServer", err)
+	if err := r.fillComputed(fctx, &plan); err != nil {
+		paidError("Could not read the vServer", "its term and addresses could not be read", err)
 		return
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
@@ -656,6 +712,14 @@ func onOff(b bool) string {
 	return "off"
 }
 
+func (r *vserverResource) setDisplayName(ctx context.Context, id, name string) error {
+	return r.client.Do(ctx, http.MethodPut, "/rootserver/"+id+"/display-name", map[string]any{"display_name": name}, nil, nil)
+}
+
+// renewGrace is how long after expire_at the platform's auto-renew cron
+// still renews a server (vServerAutoRenew: expire_at > now - 1 day).
+const renewGrace = 24 * time.Hour
+
 func (r *vserverResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state vserverModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -666,7 +730,7 @@ func (r *vserverResource) Read(ctx context.Context, req resource.ReadRequest, re
 
 	gone := func() {
 		resp.Diagnostics.AddWarning("vServer no longer exists",
-			fmt.Sprintf("vServer %s was not found in the account (cancelled or deleted outside Terraform) and is removed from the state. "+
+			fmt.Sprintf("vServer %s was not found in the account (deleted outside Terraform) and is removed from the state. "+
 				"The next apply buys a new one.", id))
 		resp.State.RemoveResource(ctx)
 	}
@@ -689,12 +753,15 @@ func (r *vserverResource) Read(ctx context.Context, req resource.ReadRequest, re
 		addAPIError(&resp.Diagnostics, "Could not read the vServer's term", err)
 		return
 	}
-	if exp != nil && exp.Before(time.Now()) {
+	// An expired server stays in the state while the API lists it: the
+	// platform may still renew it (and charge) shortly after expiry, so
+	// dropping it here could lead to a new purchase next to a late renewal.
+	expired := exp != nil && exp.Before(time.Now())
+	if expired {
 		resp.Diagnostics.AddWarning("vServer expired",
-			fmt.Sprintf("The term of vServer %s expired on %s (not renewed, or cancelled outside Terraform); it is removed from the state. "+
-				"The next apply buys a new one.", id, exp.Format(time.RFC3339)))
-		resp.State.RemoveResource(ctx)
-		return
+			fmt.Sprintf("The term of vServer %s expired on %s. With auto-renew on, the platform may still renew it until about %s; "+
+				"after that it is deleted within a few days. Renew it in the panel, or destroy it to stop renewal.",
+				id, exp.Format(time.RFC3339), exp.Add(renewGrace).Format(time.RFC3339)))
 	}
 
 	var renew vserverRenewAPI
@@ -702,7 +769,11 @@ func (r *vserverResource) Read(ctx context.Context, req resource.ReadRequest, re
 	case err == nil:
 		state.AutoRenew = types.BoolValue(renew.AutoRenew)
 	case client.IsNotFound(err):
-		gone()
+		// show and rental found it, renew is owner-only.
+		resp.Diagnostics.AddError("Not the owner of the vServer",
+			fmt.Sprintf("vServer %s is visible to this account, but you are not its owner (shared access cannot be managed by this "+
+				"provider: renewal, auto-renew and the display name are owner-only). Remove it from the configuration and the state.\n\n%s",
+				id, describeError(err)))
 		return
 	default:
 		// The renewal info prices the renewal and can fail on its own; the
@@ -715,6 +786,9 @@ func (r *vserverResource) Read(ctx context.Context, req resource.ReadRequest, re
 	}
 
 	state.applyShow(s)
+	if expired {
+		state.Status = types.StringValue(statusExpired)
+	}
 	state.ExpiresAt = types.StringNull()
 	if exp != nil {
 		state.ExpiresAt = types.StringValue(exp.Format(time.RFC3339))
@@ -732,8 +806,8 @@ func (r *vserverResource) Read(ctx context.Context, req resource.ReadRequest, re
 }
 
 // ModifyPlan refuses changes of the purchase (they would need a new
-// purchase, which the provider never makes silently), checks a new hostname
-// against the display-name rules, and announces what destroy means.
+// purchase, which the provider never makes silently) and announces what
+// destroy means.
 func (r *vserverResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.State.Raw.IsNull() {
 		return
@@ -744,9 +818,7 @@ func (r *vserverResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		return
 	}
 	if req.Plan.Raw.IsNull() {
-		resp.Diagnostics.AddWarning("Destroy cancels the vServer",
-			fmt.Sprintf("Destroying vServer %s switches auto-renew off; the server keeps running until %s. There is no refund.",
-				state.ID.ValueString(), expiryText(state.ExpiresAt)))
+		resp.Diagnostics.AddWarning("Destroy cancels the vServer", cancelText(state.ID.ValueString(), state.ExpiresAt, "Destroying"))
 		return
 	}
 	var plan vserverModel
@@ -757,6 +829,7 @@ func (r *vserverResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 
 	stateValues, planValues := state.purchaseValues(), plan.purchaseValues()
 	var changed []string
+	hostnameChanged := false
 	for _, name := range purchaseAttributes {
 		before, after := stateValues[name], planValues[name]
 		if before.IsNull() {
@@ -765,33 +838,34 @@ func (r *vserverResource) ModifyPlan(ctx context.Context, req resource.ModifyPla
 		}
 		if after.IsUnknown() || !after.Equal(before) {
 			changed = append(changed, fmt.Sprintf("%s: %s → %s", name, before, after))
+			hostnameChanged = hostnameChanged || name == "hostname"
 		}
 	}
 	if len(changed) > 0 {
+		hint := ""
+		if hostnameChanged {
+			hint = "hostname identifies the purchased server (it is the order's client reference); to rename it in the panel " +
+				"use display_name. "
+		}
 		resp.Diagnostics.AddError("Purchase arguments cannot be changed",
-			fmt.Sprintf("vServer %s was bought with another configuration:\n  %s\n\n"+
+			fmt.Sprintf("vServer %s was bought with another configuration:\n  %s\n\n%s"+
 				"Changing it would need a new purchase, and the provider never buys again silently. "+
 				"Restore the configuration of the existing server. If it was changed outside Terraform (upgrade or reinstall "+
 				"in the panel), set the configuration to the current values. To buy a different server, add a new resource "+
-				"with another hostname (and destroy this one to cancel it).", state.ID.ValueString(), strings.Join(changed, "\n  ")))
-		return
+				"with another hostname (and destroy this one to cancel it).", state.ID.ValueString(), strings.Join(changed, "\n  "), hint))
 	}
+}
 
-	if !plan.Hostname.IsUnknown() && !plan.Hostname.Equal(state.Hostname) {
-		if n := len([]rune(plan.Hostname.ValueString())); n < minDisplayName || n > maxDisplayName {
-			resp.Diagnostics.AddAttributeError(path.Root("hostname"), "hostname cannot be used as display name",
-				fmt.Sprintf("Changing the hostname of an existing vServer renames it in the panel, which takes %d to %d characters; %q has %d.",
-					minDisplayName, maxDisplayName, plan.Hostname.ValueString(), n))
-			return
-		}
-		if !state.Hostname.IsNull() {
-			resp.Diagnostics.AddAttributeWarning(path.Root("hostname"), "Hostname change renames the vServer only",
-				fmt.Sprintf("vServer %s is renamed to %q in the panel, but its order keeps the client reference %q. "+
-					"After a destroy, an apply with the new hostname does not find this server and buys a new one; "+
-					"with %q it is taken over again.",
-					state.ID.ValueString(), plan.Hostname.ValueString(), state.Hostname.ValueString(), state.Hostname.ValueString()))
-		}
+// cancelText says what cancelling means, depending on whether the term is
+// still running.
+func cancelText(id string, expiresAt types.String, verb string) string {
+	if exp, err := time.Parse(time.RFC3339, expiresAt.ValueString()); err == nil && !exp.After(time.Now()) {
+		return fmt.Sprintf("%s vServer %s switches auto-renew off. Its term already expired on %s, so the platform will not renew it "+
+			"and deletes it after the grace period. There is no refund.", verb, id, expiresAt.ValueString())
 	}
+	return fmt.Sprintf("%s vServer %s switches auto-renew off; the server keeps running until %s. There is no refund for the "+
+		"remaining term. Applying the same configuration (same hostname) before then takes it over again without a new purchase.",
+		verb, id, expiryText(expiresAt))
 }
 
 func expiryText(v types.String) string {
@@ -801,9 +875,9 @@ func expiryText(v types.String) string {
 	return v.ValueString()
 }
 
-// Update changes only hostname (display name) and auto_renew on the server;
-// everything else either cannot change (ModifyPlan) or is only used when
-// buying and is just stored.
+// Update changes only display_name and auto_renew on the server; everything
+// else either cannot change (ModifyPlan) or is only used when buying and is
+// just stored (also the purchase arguments filled in after an import).
 func (r *vserverResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, state vserverModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -813,9 +887,11 @@ func (r *vserverResource) Update(ctx context.Context, req resource.UpdateRequest
 	}
 	id := state.ID.ValueString()
 
-	if !plan.Hostname.Equal(state.Hostname) {
-		body := map[string]any{"display_name": plan.Hostname.ValueString()}
-		if err := r.client.Do(ctx, http.MethodPut, "/rootserver/"+id+"/display-name", body, nil, nil); err != nil {
+	if plan.DisplayName.IsUnknown() {
+		// Not configured and not known (after an import): stays unknown to Terraform.
+		plan.DisplayName = state.DisplayName
+	} else if !plan.DisplayName.Equal(state.DisplayName) {
+		if err := r.setDisplayName(ctx, id, plan.DisplayName.ValueString()); err != nil {
 			addAPIError(&resp.Diagnostics, "Could not rename the vServer", err)
 			return
 		}
@@ -852,9 +928,7 @@ func (r *vserverResource) Delete(ctx context.Context, req resource.DeleteRequest
 	if exp, err := r.expiry(ctx, id); err == nil && exp != nil {
 		expires = types.StringValue(exp.Format(time.RFC3339))
 	}
-	resp.Diagnostics.AddWarning("vServer cancelled, not deleted",
-		fmt.Sprintf("vServer %s keeps running until %s; auto-renew is now off. There is no refund for the remaining term. "+
-			"Applying the same configuration before then takes it over again without a new purchase.", id, expiryText(expires)))
+	resp.Diagnostics.AddWarning("vServer cancelled, not deleted", cancelText(id, expires, "Cancelling"))
 }
 
 func (r *vserverResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
