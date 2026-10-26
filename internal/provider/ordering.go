@@ -470,8 +470,10 @@ func orderErrorHint(err error, quote *client.Quote) string {
 		return "The API rejected the order; see the fields below."
 	case client.CodeDomainUnavailable:
 		domain, _ := apiErr.String("domain")
-		return fmt.Sprintf("The domain %s cannot be registered (taken or not allowed). Nothing was charged. Choose another name, "+
-			"use action = \"transfer\" with the auth code if you own it elsewhere, or `terraform import` it if it is already in this account.", domain)
+		return fmt.Sprintf("The domain %s cannot be registered (taken or not allowed). Nothing was charged. If it is already in "+
+			"this account (registered in the customer panel), bring it in with `terraform import` instead. If you own it at another "+
+			"registrar: transfers are not available through the API yet, order the transfer in the customer panel. Otherwise "+
+			"choose another name.", domain)
 	case client.CodeOrderFailed:
 		return "The order failed and was rolled back; nothing was charged. Run apply again."
 	case client.CodeInsufficientScope:

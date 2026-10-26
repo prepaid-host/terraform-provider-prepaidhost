@@ -297,6 +297,10 @@ func TestAccDNSRecord_Validation(t *testing.T) {
 		"host with space":    {map[string]string{"host": `" www"`}, `host`},
 		"empty record":       {map[string]string{"record": `""`}, `record`},
 		"no domain":          {map[string]string{"domain_id": "-"}, `domain_id`},
+		"upper-case host":    {map[string]string{"host": `"WWW"`}, `host.*lower case`},
+		"CNAME trailing dot": {map[string]string{"type": `"CNAME"`, "record": `"target.example.com."`}, `record.*trailing dot`},
+		"MX trailing dot":    {map[string]string{"type": `"MX"`, "record": `"mail.example.com."`}, `record.*trailing dot`},
+		"SRV trailing dot":   {map[string]string{"type": `"SRV"`, "record": `"sip.example.com."`, "weight": "1", "port": "5060"}, `record.*trailing dot`},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -306,6 +310,20 @@ func TestAccDNSRecord_Validation(t *testing.T) {
 	if d.api.WriteCount() != 0 {
 		t.Errorf("writes = %d, want 0", d.api.WriteCount())
 	}
+}
+
+// TXT values are sent verbatim, a trailing dot included.
+func TestAccDNSRecord_TXTVerbatim(t *testing.T) {
+	d := newDNSTest(t)
+	accTest(t, tfresource.TestStep{
+		Config: d.config(map[string]string{"type": `"TXT"`, "host": `"_note"`, "record": `"Hello, World."`}),
+		Check: checkMock(func() error {
+			if r := d.only(t); r["record"] != "Hello, World." {
+				return fmt.Errorf("record = %v", r)
+			}
+			return nil
+		}),
+	})
 }
 
 func TestAccDNSRecord_ImportErrors(t *testing.T) {

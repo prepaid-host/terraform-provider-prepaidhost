@@ -30,6 +30,10 @@ func quoteError(t *testing.T, api *testapi.Server, it map[string]any) (int, map[
 func TestDomainOrderValidation(t *testing.T) {
 	api := testapi.New(t)
 	api.SetDomainUnavailable("taken.de")
+	// Registered, so taken at the registrar: one from the panel, one ordered
+	// through the API (live client reference) — only the latter may be ordered again.
+	api.SeedDomain(map[string]any{"sld": "panel"})
+	api.SeedDomain(map[string]any{"sld": "mine", "client_reference": "mine.de"})
 	cases := map[string]struct {
 		change map[string]any
 		code   string
@@ -38,12 +42,13 @@ func TestDomainOrderValidation(t *testing.T) {
 		"duration":           {map[string]any{"duration_months": 6}, "VALIDATION_FAILED", "items.0.duration_months"},
 		"no duration":        {map[string]any{"duration_months": nil}, "VALIDATION_FAILED", "items.0.duration_months"},
 		"action":             {map[string]any{"action": "renew"}, "VALIDATION_FAILED", "items.0.action"},
-		"transfer w/o code":  {map[string]any{"action": "transfer"}, "VALIDATION_FAILED", "items.0.authcode"},
+		"transfer":           {map[string]any{"action": "transfer", "authcode": "A1"}, "VALIDATION_FAILED", "items.0.action"},
 		"no contact":         {map[string]any{"contact_id": nil}, "VALIDATION_FAILED", "items.0.contact_id"},
 		"unknown contact":    {map[string]any{"contact_id": 999999}, "VALIDATION_FAILED", "items.0.contact_id"},
 		"unknown tld":        {map[string]any{"tld": "xyz"}, "VALIDATION_FAILED", "items.0.tld"},
 		"taken":              {map[string]any{"sld": "taken"}, "DOMAIN_UNAVAILABLE", ""},
-		"taken but transfer": {map[string]any{"sld": "taken", "action": "transfer", "authcode": "A1"}, "", ""},
+		"registered (panel)": {map[string]any{"sld": "panel"}, "DOMAIN_UNAVAILABLE", ""},
+		"own API reference":  {map[string]any{"sld": "mine"}, "", ""},
 	}
 	for name, tc := range cases {
 		it := domainOrderItem(api, "example")
@@ -179,6 +184,14 @@ func TestDomainNameservers(t *testing.T) {
 		if resp.StatusCode != http.StatusUnprocessableEntity || env.Error["code"] != "VALIDATION_ERROR" {
 			t.Errorf("%s: %d %v", name, resp.StatusCode, env.Error)
 		}
+	}
+
+	// Registrar fallback: the local ns1/ns2, marked as such.
+	api.UpdateResource(testapi.ResourceDomain, id, func(a map[string]any) { a["nameserver_source"] = "local" })
+	_, env = call(t, api, http.MethodGet, p, api.Token, nil, nil)
+	_ = json.Unmarshal(env.Result, &got)
+	if got.Source != "local" || len(got.Nameservers) != 2 {
+		t.Errorf("local fallback = %+v", got)
 	}
 
 	// null resets to the platform's nameservers.

@@ -34,10 +34,9 @@ import (
 )
 
 var (
-	_ resource.ResourceWithConfigure        = &domainResource{}
-	_ resource.ResourceWithImportState      = &domainResource{}
-	_ resource.ResourceWithModifyPlan       = &domainResource{}
-	_ resource.ResourceWithConfigValidators = &domainResource{}
+	_ resource.ResourceWithConfigure   = &domainResource{}
+	_ resource.ResourceWithImportState = &domainResource{}
+	_ resource.ResourceWithModifyPlan  = &domainResource{}
 )
 
 // NewDomainResource returns the prepaidhost_domain resource.
@@ -49,6 +48,8 @@ type domainResource struct {
 
 const (
 	actionRegister = "register"
+	// actionTransfer is accepted by the schema type but refused by
+	// actionValidator: the API does not execute transfers yet.
 	actionTransfer = "transfer"
 )
 
@@ -66,7 +67,6 @@ type domainModel struct {
 	Name           types.String `tfsdk:"name"`
 	DurationMonths types.Int64  `tfsdk:"duration_months"`
 	Action         types.String `tfsdk:"action"`
-	Authcode       types.String `tfsdk:"authcode"`
 	ContactID      types.Int64  `tfsdk:"contact_id"`
 	Nameservers    types.List   `tfsdk:"nameservers"`
 	AutoRenew      types.Bool   `tfsdk:"auto_renew"`
@@ -120,6 +120,9 @@ type domainRenewAPI struct {
 
 type domainNameserversAPI struct {
 	Nameservers []string `json:"nameservers"`
+	// Source is "registrar", or "local" when the registrar did not answer and
+	// the API fell back to its own copy (only ns1/ns2).
+	Source string `json:"source"`
 }
 
 // ---- schema ----
@@ -130,17 +133,19 @@ func (r *domainResource) Metadata(_ context.Context, req resource.MetadataReques
 
 func (r *domainResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "A domain, registered or transferred and paid from the prepaid balance. The TLD must be in the " +
+		MarkdownDescription: "A domain, registered and paid from the prepaid balance. The TLD must be in the " +
 			"`prepaidhost_catalog` data source (type `domain`); the owner is a `prepaidhost_domain_contact`.\n\n" +
 			"**Creating the resource spends money.** Create quotes the order, checks `max_price`, orders with a " +
-			"deterministic Idempotency-Key and waits until the registrar accepted the registration or transfer. An apply " +
-			"repeated after an abort (even in a new process) gets the paid order back instead of buying again; a live domain " +
-			"with the same `name` ordered through the API is taken over instead of buying it again (with a warning, and " +
-			"auto-renew switched on again). A domain registered in the panel is brought in with `terraform import`.\n\n" +
+			"deterministic Idempotency-Key and waits until the registrar accepted the registration. An apply repeated after " +
+			"an abort (even in a new process) gets the paid order back instead of buying again, and a live domain with the " +
+			"same `name` that was ordered through the API is taken over instead of buying it again (with a warning, and " +
+			"auto-renew switched on again). A domain registered in the customer panel cannot be taken over this way: the " +
+			"order answers `DOMAIN_UNAVAILABLE` (it is registered) — bring it in with `terraform import` instead. Domain " +
+			"transfers are not available through the API yet; order them in the customer panel and import the domain.\n\n" +
 			"**Destroying the resource cancels, it does not delete:** auto-renew is switched off and the domain stays " +
 			"registered until `expires_at`; after that it is not renewed and the registration lapses. There is no refund " +
-			"for the remaining term. Applying the same configuration before that date takes the domain over again without " +
-			"a new purchase.\n\n" +
+			"for the remaining term. Applying the same configuration before that date takes a domain ordered through the API " +
+			"over again without a new purchase; an imported (panel) domain has to be imported again.\n\n" +
 			"The purchase arguments (`name`, `duration_months`, `action`) are never changed in place and never replace the " +
 			"domain: a change is a plan error. `nameservers` and `auto_renew` are updated in place.\n\n" +
 			"A domain deleted outside Terraform is removed from the state. A domain whose term expired stays in the state " +
@@ -174,20 +179,13 @@ func (r *domainResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 				Validators:          []validator.Int64{int64validator.OneOf(12, 24, 36)},
 			},
 			"action": schema.StringAttribute{
-				MarkdownDescription: purchaseNote("`register` (default; the API checks that the name is available) or `transfer` " +
-					"(needs `authcode`). The API cannot read it back."),
+				MarkdownDescription: purchaseNote("Only `register` (the default; the API checks that the name is available). " +
+					"Transfers are not available through the API yet: order them in the customer panel and import the domain. " +
+					"The API cannot read it back."),
 				Optional:   true,
 				Computed:   true,
 				Default:    stringdefault.StaticString(actionRegister),
-				Validators: []validator.String{stringvalidator.OneOf(actionRegister, actionTransfer)},
-			},
-			"authcode": schema.StringAttribute{
-				MarkdownDescription: "Auth code (EPP code) from the current registrar; required with `action = \"transfer\"` and " +
-					"not allowed otherwise. Write-only: it is sent with the order and never stored in the state, never part of " +
-					"the Idempotency-Key and never logged. Only used when buying. Needs Terraform 1.11+ or OpenTofu 1.11+.",
-				Optional:  true,
-				Sensitive: true,
-				WriteOnly: true,
+				Validators: []validator.String{actionValidator{}},
 			},
 			"contact_id": schema.Int64Attribute{
 				MarkdownDescription: "Id of the domain contact (`prepaidhost_domain_contact`) that becomes the owner. Only used " +
@@ -249,32 +247,28 @@ func (r *domainResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 	}
 }
 
-func (r *domainResource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
-	return []resource.ConfigValidator{authcodeValidator{}}
-}
+// actionValidator accepts only "register": the API refuses transfers for now
+// (422 on items.0.action), so the plan says so before anything is quoted.
+type actionValidator struct{}
 
-// authcodeValidator: a transfer needs the auth code, a registration takes none.
-type authcodeValidator struct{}
-
-func (authcodeValidator) Description(context.Context) string {
-	return `authcode is required with action = "transfer" and not allowed otherwise`
+func (actionValidator) Description(context.Context) string {
+	return `must be "register"; transfers are not available through the API yet`
 }
-func (v authcodeValidator) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
-func (authcodeValidator) ValidateResource(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
-	var action, authcode types.String
-	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("action"), &action)...)
-	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("authcode"), &authcode)...)
-	if resp.Diagnostics.HasError() || action.IsUnknown() || authcode.IsUnknown() {
+func (v actionValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+func (actionValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
 		return
 	}
-	transfer := action.ValueString() == actionTransfer
-	switch {
-	case transfer && authcode.ValueString() == "":
-		resp.Diagnostics.AddAttributeError(path.Root("authcode"), "Missing authcode",
-			`action = "transfer" needs the authcode (EPP code) from the current registrar.`)
-	case !transfer && !authcode.IsNull():
-		resp.Diagnostics.AddAttributeError(path.Root("authcode"), "Unexpected authcode",
-			`authcode is only used with action = "transfer"; a registration takes none.`)
+	switch v := req.ConfigValue.ValueString(); v {
+	case actionRegister:
+	case actionTransfer:
+		resp.Diagnostics.AddAttributeError(req.Path, "Transfers not available",
+			"Domain transfers are not available through the API yet. Order the transfer in the customer panel, then bring the "+
+				"domain in with `terraform import`.")
+	default:
+		resp.Diagnostics.AddAttributeError(req.Path, "Invalid action", fmt.Sprintf(`action must be "register", got %q.`, v))
 	}
 }
 
@@ -314,8 +308,8 @@ func (r *domainResource) Configure(_ context.Context, req resource.ConfigureRequ
 // ---- order item ----
 
 // orderItem is exactly the API's domain INPUT_KEYS that are set; the engine
-// adds client_reference (= name). The auth code goes only into a transfer.
-func (m *domainModel) orderItem(authcode types.String) map[string]any {
+// adds client_reference (= name).
+func (m *domainModel) orderItem() map[string]any {
 	sld, tld := splitDomainName(m.Name.ValueString())
 	item := map[string]any{
 		"type":            "domain",
@@ -324,9 +318,6 @@ func (m *domainModel) orderItem(authcode types.String) map[string]any {
 		"duration_months": m.DurationMonths.ValueInt64(),
 		"action":          m.Action.ValueString(),
 		"contact_id":      m.ContactID.ValueInt64(),
-	}
-	if m.Action.ValueString() == actionTransfer {
-		item["authcode"] = authcode.ValueString()
 	}
 	return item
 }
@@ -382,12 +373,14 @@ func nameserverList(list []string) types.List {
 	return types.ListValueMust(types.StringType, values)
 }
 
-func (r *domainResource) nameservers(ctx context.Context, id string) (types.List, error) {
+// nameservers reads the nameservers; local is true when they come from the
+// API's local fallback instead of the registrar.
+func (r *domainResource) nameservers(ctx context.Context, id string) (list types.List, local bool, err error) {
 	var ns domainNameserversAPI
 	if err := r.client.Do(ctx, http.MethodGet, "/domain/"+id+"/nameservers", nil, &ns, nil); err != nil {
-		return types.ListNull(types.StringType), err
+		return types.ListNull(types.StringType), false, err
 	}
-	return nameserverList(ns.Nameservers), nil
+	return nameserverList(ns.Nameservers), ns.Source == "local", nil
 }
 
 func (r *domainResource) setNameservers(ctx context.Context, id string, want types.List) (types.List, error) {
@@ -431,8 +424,6 @@ func (m *domainModel) setTerm(exp *time.Time) {
 func (r *domainResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan domainModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	var authcode types.String
-	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("authcode"), &authcode)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -446,7 +437,7 @@ func (r *domainResource) Create(ctx context.Context, req resource.CreateRequest,
 	}
 	name := plan.Name.ValueString()
 
-	resourceID, outcome, diags := orderResource(ctx, r.client, plan.orderItem(authcode), name, maxPrice, timeout,
+	resourceID, outcome, diags := orderResource(ctx, r.client, plan.orderItem(), name, maxPrice, timeout,
 		orderOptions{PromoCode: plan.PromoCode.ValueString()})
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -492,7 +483,7 @@ func (r *domainResource) Create(ctx context.Context, req resource.CreateRequest,
 				"Auto-renew is %s.", id, name, onOff(wantRenew)))
 	}
 
-	current, err := r.nameservers(pctx, id)
+	current, _, err := r.nameservers(pctx, id)
 	if err != nil {
 		paidError("Could not read the nameservers", "its nameservers could not be read", describeError(err))
 		return
@@ -569,7 +560,7 @@ func (r *domainResource) Read(ctx context.Context, req resource.ReadRequest, res
 				"panel while the registry still allows it, or destroy it to stop managing it.", id, name, exp.Format(time.RFC3339)))
 	}
 
-	ns, err := r.nameservers(ctx, id)
+	ns, local, err := r.nameservers(ctx, id)
 	if client.IsNotFound(err) {
 		gone()
 		return
@@ -577,6 +568,14 @@ func (r *domainResource) Read(ctx context.Context, req resource.ReadRequest, res
 	if err != nil {
 		addAPIError(&resp.Diagnostics, "Could not read the domain's nameservers", err)
 		return
+	}
+	if local && !state.Nameservers.IsNull() && !state.Nameservers.IsUnknown() {
+		// The fallback only knows ns1/ns2: comparing it would show drift that
+		// is not there.
+		resp.Diagnostics.AddWarning("Nameservers not readable from the registrar",
+			fmt.Sprintf("The registrar did not answer for domain %s, and the API only has its local copy of ns1/ns2. The "+
+				"nameservers keep their last known value; the next refresh reads them again.", id))
+		ns = state.Nameservers
 	}
 
 	state.Name = types.StringValue(name)
@@ -650,7 +649,8 @@ func domainCancelText(id string, expiresAt types.String, verb string) string {
 	}
 	return fmt.Sprintf("%s domain %s switches auto-renew off; the domain stays registered until %s and is not renewed after "+
 		"that, so the registration lapses and the name can be lost. There is no refund for the remaining term. Applying the "+
-		"same configuration (same name) before then takes it over again without a new purchase.", verb, id, expiryText(expiresAt))
+		"same configuration (same name) before then takes a domain ordered through the API over again without a new purchase; "+
+		"a domain imported from the panel has to be imported again.", verb, id, expiryText(expiresAt))
 }
 
 // Update changes only the nameservers and auto_renew; everything else is

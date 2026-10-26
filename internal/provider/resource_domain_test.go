@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
@@ -153,39 +154,6 @@ func TestAccDomain_MultiLabelTLD(t *testing.T) {
 	})
 }
 
-func TestAccDomain_Transfer(t *testing.T) {
-	d := newDomainTest(t)
-	accTest(t, tfresource.TestStep{
-		Config: d.config(map[string]string{"action": `"transfer"`, "authcode": `"AUTH-1234"`}),
-		Check: tfresource.ComposeAggregateTestCheckFunc(
-			tfresource.TestCheckResourceAttr(domainAddr, "action", "transfer"),
-			// Write-only: never in the state.
-			tfresource.TestCheckNoResourceAttr(domainAddr, "authcode"),
-			checkMock(func() error {
-				it := lastOrderItem(t, d.api)
-				if it["action"] != "transfer" || it["authcode"] != "AUTH-1234" {
-					return fmt.Errorf("item = %v", it)
-				}
-				// The auth code is never key material.
-				want, err := idempotencyKey("domain", "example.de", map[string]any{
-					"sld": "example", "tld": "de", "duration_months": 12, "action": "transfer",
-				}, "")
-				if err != nil {
-					return err
-				}
-				for _, r := range d.api.Requests() {
-					if r.Method == http.MethodPost && r.Path == "/orders" {
-						if got := r.Header.Get("Idempotency-Key"); got != want || strings.Contains(got, "AUTH") {
-							return fmt.Errorf("Idempotency-Key = %q, want %q", got, want)
-						}
-					}
-				}
-				return nil
-			}),
-		),
-	})
-}
-
 // Config errors are caught at plan time: nothing is quoted or ordered.
 func TestAccDomain_ConfigValidation(t *testing.T) {
 	d := newDomainTest(t)
@@ -193,20 +161,19 @@ func TestAccDomain_ConfigValidation(t *testing.T) {
 		set map[string]string
 		err string
 	}{
-		"transfer without authcode": {map[string]string{"action": `"transfer"`}, `authcode.*transfer`},
-		"authcode with register":    {map[string]string{"authcode": `"X"`}, `authcode.*transfer`},
-		"no contact_id":             {map[string]string{"contact_id": "-"}, `contact_id`},
-		"bad action":                {map[string]string{"action": `"renew"`}, `action`},
-		"bad duration":              {map[string]string{"duration_months": "6"}, `duration_months`},
-		"upper case":                {map[string]string{"name": `"Example.de"`}, `name`},
-		"single label":              {map[string]string{"name": `"example"`}, `name`},
-		"trailing dot":              {map[string]string{"name": `"example.de."`}, `name`},
-		"leading hyphen":            {map[string]string{"name": `"-example.de"`}, `name`},
-		"too long":                  {map[string]string{"name": `"` + strings.Repeat("a", 62) + `.de"`}, `name`},
-		"one nameserver":            {map[string]string{"nameservers": `["ns1.example.com"]`}, `nameservers`},
-		"nameserver ip":             {map[string]string{"nameservers": `["ns1.example.com", "192.0.2.1"]`}, `nameservers`},
-		"nameserver upper":          {map[string]string{"nameservers": `["NS1.example.com", "ns2.example.com"]`}, `nameservers`},
-		"nameserver dot":            {map[string]string{"nameservers": `["ns1.example.com.", "ns2.example.com"]`}, `nameservers`},
+		"transfer":         {map[string]string{"action": `"transfer"`}, `(?i)transfers.*not available.*customer panel`},
+		"no contact_id":    {map[string]string{"contact_id": "-"}, `contact_id`},
+		"bad action":       {map[string]string{"action": `"renew"`}, `action`},
+		"bad duration":     {map[string]string{"duration_months": "6"}, `duration_months`},
+		"upper case":       {map[string]string{"name": `"Example.de"`}, `name`},
+		"single label":     {map[string]string{"name": `"example"`}, `name`},
+		"trailing dot":     {map[string]string{"name": `"example.de."`}, `name`},
+		"leading hyphen":   {map[string]string{"name": `"-example.de"`}, `name`},
+		"too long":         {map[string]string{"name": `"` + strings.Repeat("a", 62) + `.de"`}, `name`},
+		"one nameserver":   {map[string]string{"nameservers": `["ns1.example.com"]`}, `nameservers`},
+		"nameserver ip":    {map[string]string{"nameservers": `["ns1.example.com", "192.0.2.1"]`}, `nameservers`},
+		"nameserver upper": {map[string]string{"nameservers": `["NS1.example.com", "ns2.example.com"]`}, `nameservers`},
+		"nameserver dot":   {map[string]string{"nameservers": `["ns1.example.com.", "ns2.example.com"]`}, `nameservers`},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -223,10 +190,25 @@ func TestAccDomain_Unavailable(t *testing.T) {
 	d.api.SetDomainUnavailable("example.de")
 	accTest(t, tfresource.TestStep{
 		Config:      d.config(nil),
-		ExpectError: re(`(?s)example\.de cannot be registered.*transfer.*terraform import.*DOMAIN_UNAVAILABLE`),
+		ExpectError: re(`(?s)example\.de cannot be registered.*terraform import.*DOMAIN_UNAVAILABLE`),
 	})
 	if d.api.ChargeCount() != 0 || len(d.api.ResourceIDs(testapi.ResourceDomain)) != 0 || d.api.CallCount(http.MethodPost, "/orders") != 0 {
 		t.Errorf("charges = %d, domains = %v", d.api.ChargeCount(), d.api.ResourceIDs(testapi.ResourceDomain))
+	}
+}
+
+// A domain registered in the panel is taken at the registrar and carries no
+// API order reference: ordering it is DOMAIN_UNAVAILABLE with the import hint,
+// nothing is charged.
+func TestAccDomain_PanelDomainNeedsImport(t *testing.T) {
+	d := newDomainTest(t)
+	existing := d.api.SeedDomain(map[string]any{"sld": "example", "tld": "de"})
+	accTest(t, tfresource.TestStep{
+		Config:      d.config(nil),
+		ExpectError: re(`(?s)example\.de cannot be registered.*already in this account.*terraform import.*DOMAIN_UNAVAILABLE`),
+	})
+	if d.api.ChargeCount() != 0 || d.api.CallCount(http.MethodPost, "/orders") != 0 || len(d.api.ResourceIDs(testapi.ResourceDomain)) != 1 {
+		t.Errorf("charges = %d, domains = %v (want only %d)", d.api.ChargeCount(), d.api.ResourceIDs(testapi.ResourceDomain), existing)
 	}
 }
 
@@ -246,10 +228,6 @@ func TestAccDomain_PurchaseFieldChangeIsAPlanError(t *testing.T) {
 		tfresource.TestStep{
 			Config:      d.config(map[string]string{"duration_months": "24"}),
 			ExpectError: re(`(?s)Purchase arguments cannot be changed.*duration_months`),
-		},
-		tfresource.TestStep{
-			Config:      d.config(map[string]string{"action": `"transfer"`, "authcode": `"X"`}),
-			ExpectError: re(`(?s)Purchase arguments cannot be changed.*action`),
 		},
 		tfresource.TestStep{
 			PreConfig: func() {
@@ -362,6 +340,24 @@ func TestAccDomain_NameserverDrift(t *testing.T) {
 				}
 				return nil
 			}),
+		},
+	)
+}
+
+// The registrar did not answer and the API fell back to its local ns1/ns2
+// (source "local"): that is not drift, the state keeps its value.
+func TestAccDomain_LocalNameserversAreNoDrift(t *testing.T) {
+	d := newDomainTest(t)
+	cfg := d.config(map[string]string{"nameservers": `["ns1.example.net", "ns2.example.net", "ns3.example.net"]`})
+	accTest(t,
+		tfresource.TestStep{Config: cfg},
+		tfresource.TestStep{
+			PreConfig: func() {
+				d.api.UpdateResource(testapi.ResourceDomain, domainID(t, d.api), func(a map[string]any) { a["nameserver_source"] = "local" })
+			},
+			Config:   cfg,
+			PlanOnly: true,
+			Check:    tfresource.TestCheckResourceAttr(domainAddr, "nameservers.#", "3"),
 		},
 	)
 }
@@ -626,11 +622,11 @@ func (d domainTest) resource() *domainResource {
 	return res
 }
 
-func TestDomain_AuthcodeIsWriteOnlyAndSensitive(t *testing.T) {
+func TestDomain_Schema(t *testing.T) {
 	sch := domainSchema(t)
-	a := sch.Schema.Attributes["authcode"]
-	if a == nil || !a.IsWriteOnly() || !a.IsSensitive() || !a.IsOptional() {
-		t.Errorf("authcode must be optional, write-only and sensitive: %+v", a)
+	// Transfers are not available through the API: no auth code to take.
+	if _, ok := sch.Schema.Attributes["authcode"]; ok {
+		t.Errorf("authcode must not exist while transfers are refused")
 	}
 	for _, f := range []string{"id", "status", "expires_at"} {
 		if a := sch.Schema.Attributes[f]; a == nil || !a.IsComputed() || a.IsOptional() {
@@ -683,6 +679,26 @@ func TestDomain_ReadExpiredWarnsAndKeeps(t *testing.T) {
 	if w := resp.Diagnostics.Warnings(); len(w) != 1 || !strings.Contains(w[0].Detail(), "expired on") ||
 		!strings.Contains(w[0].Detail(), "no longer renews it") {
 		t.Errorf("want an expiry warning, got %v", resp.Diagnostics)
+	}
+}
+
+func TestDomain_ReadLocalNameserversKeepState(t *testing.T) {
+	d := newDomainTest(t)
+	id := d.api.SeedDomain(map[string]any{"nameserver_source": "local"})
+	sch := domainSchema(t)
+	vals := d.values()
+	vals["id"] = str(strconv.FormatInt(id, 10))
+	vals["nameservers"] = tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, []tftypes.Value{str("a.example.net"), str("b.example.net"), str("c.example.net")})
+	state := tfsdk.State{Schema: sch.Schema, Raw: tfValue(t, sch, vals, true)}
+	resp := resource.ReadResponse{State: state}
+	d.resource().Read(context.Background(), resource.ReadRequest{State: state}, &resp)
+	var ns []string
+	resp.State.GetAttribute(context.Background(), path.Root("nameservers"), &ns)
+	if resp.Diagnostics.HasError() || fmt.Sprint(ns) != "[a.example.net b.example.net c.example.net]" {
+		t.Errorf("nameservers = %v, want the state kept (%v)", ns, resp.Diagnostics)
+	}
+	if w := resp.Diagnostics.Warnings(); len(w) != 1 || !strings.Contains(w[0].Detail(), "registrar") {
+		t.Errorf("want a warning about the registrar, got %v", resp.Diagnostics)
 	}
 }
 

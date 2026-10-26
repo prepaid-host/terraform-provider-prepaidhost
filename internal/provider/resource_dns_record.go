@@ -47,6 +47,9 @@ var (
 	dnsTTLs        = []int64{60, 300, 600, 900, 1800, 3600, 21600, 43200, 86400, 172800, 259200, 604800, 1209600, 2592000}
 	// noOuterSpace: the API trims the host, so surrounding blanks would be a permanent diff.
 	noOuterSpace = regexp.MustCompile(`^\S(.*\S)?$`)
+	// noUpperCase: DNS names are case-insensitive and the DNS provider may
+	// store them in lower case; a mixed-case host would be a permanent diff.
+	noUpperCase = regexp.MustCompile(`^[^A-Z]*$`)
 )
 
 const (
@@ -128,19 +131,21 @@ func (r *dnsRecordResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				PlanModifiers: []planmodifier.String{stringplanmodifier.RequiresReplace()},
 			},
 			"host": schema.StringAttribute{
-				MarkdownDescription: "Host relative to the zone, e.g. `www` or `_dmarc`; `@` (the default) is the zone root.",
+				MarkdownDescription: "Host relative to the zone in lower case, e.g. `www` or `_dmarc`; `@` (the default) is the zone root.",
 				Optional:            true,
 				Computed:            true,
 				Default:             stringdefault.StaticString("@"),
 				Validators: []validator.String{
 					stringvalidator.LengthBetween(1, 255),
 					stringvalidator.RegexMatches(noOuterSpace, "must not start or end with blanks"),
+					stringvalidator.RegexMatches(noUpperCase, "must be in lower case (DNS names are case-insensitive)"),
 				},
 			},
 			"record": schema.StringAttribute{
-				MarkdownDescription: "Value of the record (address, target host or text), at most 2048 characters.",
-				Required:            true,
-				Validators:          []validator.String{stringvalidator.LengthBetween(1, 2048)},
+				MarkdownDescription: "Value of the record (address, target host or text), at most 2048 characters. Target hosts of " +
+					"`CNAME`, `MX` and `SRV` are written without trailing dot (`mail.example.com`). `TXT` values are sent verbatim.",
+				Required:   true,
+				Validators: []validator.String{stringvalidator.LengthBetween(1, 2048)},
 			},
 			"ttl": schema.Int64Attribute{
 				MarkdownDescription: "TTL in seconds, one of 60, 300, 600, 900, 1800, 3600, 21600, 43200, 86400, 172800, 259200, " +
@@ -192,6 +197,11 @@ func (dnsTypeFieldsValidator) ValidateResource(ctx context.Context, req resource
 		return
 	}
 	typ := m.Type.ValueString()
+	if (typ == "CNAME" || typ == "MX" || typ == "SRV") && strings.HasSuffix(m.Record.ValueString(), ".") {
+		resp.Diagnostics.AddAttributeError(path.Root("record"), "Trailing dot in record",
+			fmt.Sprintf("Write the target host of a %s record without trailing dot (e.g. mail.example.com); the DNS provider "+
+				"stores it in that form, so a trailing dot would show as a change on every plan.", typ))
+	}
 	if !hasPriority(typ) && !m.Priority.IsNull() {
 		resp.Diagnostics.AddAttributeError(path.Root("priority"), "priority not allowed",
 			fmt.Sprintf("priority is only used with MX and SRV records, not with %s (the API would ignore it).", typ))

@@ -31,7 +31,8 @@ import (
 // Domain attributes in State.Resources["domain"]: sld, tld, name, authcode,
 // owner, auto_renew (bool), created_at / expires_at (RFC 3339), nameservers
 // ([]string), dns_records ([]map[string]any, host "" = zone root, like
-// ClouDNS) and no_rental (mock only: the domain has no rental row).
+// ClouDNS), no_rental (mock only: the domain has no rental row) and
+// nameserver_source (mock only: "local" = the registrar did not answer).
 func init() {
 	register(func(s *Server) {
 		s.Handle(http.MethodGet, "/domain/{id}", handleShowDomain)
@@ -102,16 +103,15 @@ func (st *State) validateDomainItem(index int, it map[string]any) *Response {
 	if !slices.Contains(domainDurations, toInt(it["duration_months"])) || !isIntegral(it["duration_months"]) {
 		return invalid("duration_months", "The selected duration months is invalid.")
 	}
-	action := "register"
 	if v, ok := it["action"]; ok && v != nil {
-		a, _ := v.(string)
-		if a != "register" && a != "transfer" {
+		switch a, _ := v.(string); a {
+		case "register":
+		case "transfer":
+			// The API does not execute transfers (yet): refused before anything is charged.
+			return invalid("action", "Domain-Transfers sind über die API nicht verfügbar. Bitte im Kundenbereich beauftragen.")
+		default:
 			return invalid("action", "The selected action is invalid.")
 		}
-		action = a
-	}
-	if code, _ := it["authcode"].(string); action == "transfer" && code == "" {
-		return invalid("authcode", "The authcode field is required.")
 	}
 	if it["contact_id"] == nil {
 		return invalid("contact_id", "The contact id field is required.")
@@ -122,13 +122,30 @@ func (st *State) validateDomainItem(index int, it map[string]any) *Response {
 	if !st.knownTLD(tld) {
 		return invalid("tld", "Ungültige TLD.")
 	}
+	// A register is checked at the registrar, where every registered domain
+	// is taken — also the caller's own. The check is skipped only when the
+	// caller holds a live API-ordered item with this name as client
+	// reference: the order then replays (same key) or answers
+	// CLIENT_REFERENCE_IN_USE. A domain registered in the panel has no such
+	// item, so it stays unavailable.
 	name := domainName(it)
-	if action == "register" && st.UnavailableDomains[name] {
+	if _, _, held := st.referenceInUse(name); !held && (st.UnavailableDomains[name] || st.domainRegistered(name)) {
 		resp := Fail(http.StatusUnprocessableEntity, "DOMAIN_UNAVAILABLE", fmt.Sprintf("Die Domain %s ist nicht registrierbar.", name),
 			map[string]any{"domain": name})
 		return &resp
 	}
 	return nil
+}
+
+// domainRegistered reports whether a domain of this name exists in the mock
+// (i.e. it is registered at the "registrar").
+func (st *State) domainRegistered(name string) bool {
+	for _, id := range st.ResourceIDs(ResourceDomain) {
+		if st.Resources[ResourceDomain][id]["name"] == name {
+			return true
+		}
+	}
+	return false
 }
 
 func isIntegral(v any) bool {
@@ -293,6 +310,11 @@ func handleDomainNameservers(st *State, r *Request) Response {
 		return abort404()
 	}
 	ns, _ := attrs["nameservers"].([]string)
+	// NameserverService::get falls back to the local ns1/ns2 columns when the
+	// registrar has no answer (mock: nameserver_source = "local").
+	if attrs["nameserver_source"] == "local" {
+		return OK(map[string]any{"nameservers": append([]string{}, ns[:min(2, len(ns))]...), "source": "local"})
+	}
 	return OK(map[string]any{"nameservers": append([]string{}, ns...), "source": "registrar"})
 }
 
