@@ -506,13 +506,20 @@ func TestAccVserver_AbortedApplyIsNotBoughtTwice(t *testing.T) {
 // the installation.
 func TestAccVserver_AdoptsInstallingServer(t *testing.T) {
 	api := vserverAPI(t)
-	existing := api.SeedRootserver(map[string]any{"client_reference": "web1", "auto_renew": false, "installed": false})
+	existing := api.SeedRootserver(map[string]any{"client_reference": "web1", "auto_renew": false, "installed": false, "display_name": "Panel Name"})
 	api.SetInstallAfterReads(existing, 3)
 	accTest(t, tfresource.TestStep{
 		Config: vserverConfig(api, nil),
 		Check: tfresource.ComposeAggregateTestCheckFunc(
 			tfresource.TestCheckResourceAttr(vserverAddr, "id", strconv.FormatInt(existing, 10)),
 			tfresource.TestCheckResourceAttr(vserverAddr, "status", "active"),
+			tfresource.TestCheckNoResourceAttr(vserverAddr, "display_name"),
+			checkMock(func() error {
+				if got := serverAttr(api, existing, "display_name"); got != "Panel Name" {
+					return fmt.Errorf("display_name = %v: a taken-over server keeps its panel name", got)
+				}
+				return nil
+			}),
 			wantCharges(api, 0),
 			checkMock(func() error {
 				if got := serverAttr(api, existing, "auto_renew"); got != true {
@@ -521,7 +528,7 @@ func TestAccVserver_AdoptsInstallingServer(t *testing.T) {
 				return nil
 			}),
 		),
-	})
+	}, tfresource.TestStep{Config: vserverConfig(api, nil), PlanOnly: true})
 }
 
 func TestAccVserver_AdoptedServerNotInstalledInTime(t *testing.T) {
@@ -813,6 +820,13 @@ func TestVserver_AdoptionWarns(t *testing.T) {
 		!strings.Contains(w[0].Detail(), "Auto-renew is on") {
 		t.Errorf("want the take-over warning naming %d, got %v", existing, resp.Diagnostics)
 	}
+	// Follow-up T6: the panel name of a taken-over server is unknown (not
+	// readable); it is not claimed to be the hostname.
+	var dn types.String
+	resp.State.GetAttribute(context.Background(), path.Root("display_name"), &dn)
+	if !dn.IsNull() {
+		t.Errorf("display_name = %v, want null for a taken-over server without configured display_name", dn)
+	}
 }
 
 func TestVserver_NewOrderDoesNotWarn(t *testing.T) {
@@ -860,6 +874,18 @@ func TestVserver_ReadExpiredWarnsAndKeeps(t *testing.T) {
 	if w := resp.Diagnostics.Warnings(); len(w) != 1 || !strings.Contains(w[0].Detail(), "expired on") ||
 		!strings.Contains(w[0].Detail(), "destroy it to stop renewal") {
 		t.Errorf("want an expiry warning, got %v", resp.Diagnostics)
+	}
+}
+
+// Follow-up T6: with auto-renew off the warning does not speak of a late renewal.
+func TestVserver_ReadExpiredWithAutoRenewOff(t *testing.T) {
+	api := vserverAPI(t)
+	id := api.SeedRootserver(map[string]any{"expires_at": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339), "auto_renew": false})
+	resp := readDirect(t, api, id, nil)
+	w := resp.Diagnostics.Warnings()
+	if resp.Diagnostics.HasError() || len(w) != 1 || !strings.Contains(w[0].Detail(), "expired on") ||
+		!strings.Contains(w[0].Detail(), "Auto-renew is off") || strings.Contains(w[0].Detail(), "may still renew") {
+		t.Errorf("want an expiry warning without the late-renewal hint, got %v", resp.Diagnostics)
 	}
 }
 

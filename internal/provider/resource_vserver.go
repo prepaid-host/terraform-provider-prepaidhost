@@ -226,8 +226,10 @@ func (r *vserverResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 				},
 			},
 			"display_name": schema.StringAttribute{
-				MarkdownDescription: "Name of the server in the panel (4–32 characters). Defaults to `hostname` when the server " +
-					"is bought; changed in place. The API cannot read it back.",
+				MarkdownDescription: "Name of the server in the panel (4–32 characters); changed in place. The API cannot read it " +
+					"back. Without it, a newly bought server is named after `hostname` (which may be shorter than 4 or longer than " +
+					"32 characters — copied into the configuration it then fails this validation, so choose a valid name instead), " +
+					"and for a server that was taken over or imported it stays unknown (null).",
 				Optional:      true,
 				Computed:      true,
 				Validators:    []validator.String{stringvalidator.LengthBetween(minDisplayName, maxDisplayName)},
@@ -685,11 +687,17 @@ func (r *vserverResource) Create(ctx context.Context, req resource.CreateRequest
 
 	fctx, cancelFill := postCtx()
 	defer cancelFill()
-	// The fulfiller names the server after the hostname; a configured
-	// display_name is set on top.
-	if plan.DisplayName.IsUnknown() || plan.DisplayName.IsNull() {
+	// The fulfiller names a new server after the hostname; a configured
+	// display_name is set on top. A server that existed keeps its panel name,
+	// which the API cannot read: without a configured display_name it stays
+	// unknown (null) rather than claimed to be the hostname.
+	switch {
+	case plan.DisplayName.IsUnknown() || plan.DisplayName.IsNull():
 		plan.DisplayName = types.StringValue(hostname)
-	} else if plan.DisplayName.ValueString() != hostname || existed {
+		if existed {
+			plan.DisplayName = types.StringNull()
+		}
+	case plan.DisplayName.ValueString() != hostname || existed:
 		if err := r.setDisplayName(fctx, id, plan.DisplayName.ValueString()); err != nil {
 			paidError("Could not set the display name", "its display name could not be set", err)
 			return
@@ -753,17 +761,6 @@ func (r *vserverResource) Read(ctx context.Context, req resource.ReadRequest, re
 		addAPIError(&resp.Diagnostics, "Could not read the vServer's term", err)
 		return
 	}
-	// An expired server stays in the state while the API lists it: the
-	// platform may still renew it (and charge) shortly after expiry, so
-	// dropping it here could lead to a new purchase next to a late renewal.
-	expired := exp != nil && exp.Before(time.Now())
-	if expired {
-		resp.Diagnostics.AddWarning("vServer expired",
-			fmt.Sprintf("The term of vServer %s expired on %s. With auto-renew on, the platform may still renew it until about %s; "+
-				"after that it is deleted within a few days. Renew it in the panel, or destroy it to stop renewal.",
-				id, exp.Format(time.RFC3339), exp.Add(renewGrace).Format(time.RFC3339)))
-	}
-
 	var renew vserverRenewAPI
 	switch err := r.client.Do(ctx, http.MethodGet, "/rootserver/"+id+"/renew", nil, &renew, nil); {
 	case err == nil:
@@ -783,6 +780,22 @@ func (r *vserverResource) Read(ctx context.Context, req resource.ReadRequest, re
 		if state.AutoRenew.IsNull() || state.AutoRenew.IsUnknown() {
 			state.AutoRenew = types.BoolValue(true)
 		}
+	}
+
+	// An expired server stays in the state while the API lists it: the
+	// platform may still renew it (and charge) shortly after expiry, so
+	// dropping it here could lead to a new purchase next to a late renewal.
+	// The warning follows auto-renew as just read.
+	expired := exp != nil && exp.Before(time.Now())
+	if expired {
+		detail := fmt.Sprintf("The term of vServer %s expired on %s. With auto-renew on, the platform may still renew it until about %s; "+
+			"after that it is deleted within a few days. Renew it in the panel, or destroy it to stop renewal.",
+			id, exp.Format(time.RFC3339), exp.Add(renewGrace).Format(time.RFC3339))
+		if !state.AutoRenew.ValueBool() {
+			detail = fmt.Sprintf("The term of vServer %s expired on %s. Auto-renew is off, so the platform does not renew it; it is "+
+				"deleted within a few days. Renew it in the panel, or destroy it to remove it from Terraform.", id, exp.Format(time.RFC3339))
+		}
+		resp.Diagnostics.AddWarning("vServer expired", detail)
 	}
 
 	state.applyShow(s)
