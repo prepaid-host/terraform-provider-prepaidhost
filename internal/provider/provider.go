@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -28,6 +29,9 @@ const (
 	EnvToken = "PREPAIDHOST_TOKEN"
 	// EnvEndpoint is the environment variable read when endpoint is not configured.
 	EnvEndpoint = "PREPAIDHOST_ENDPOINT"
+
+	// endpointCheckTimeout bounds the one endpoint check of Configure.
+	endpointCheckTimeout = 15 * time.Second
 )
 
 var _ provider.Provider = &PrepaidHostProvider{}
@@ -133,6 +137,20 @@ func (p *PrepaidHostProvider) Configure(ctx context.Context, req provider.Config
 
 	opts := append([]client.Option{client.WithUserAgent("terraform-provider-prepaidhost/" + p.version)}, p.clientOptions...)
 	c := client.New(endpoint, token, opts...)
+
+	// A wrong endpoint (a path without /api, a web page) would answer every
+	// call with 404 — which a Read must not take for "the resource is gone".
+	// Check it once before any resource uses the client.
+	checkCtx, cancel := context.WithTimeout(ctx, endpointCheckTimeout)
+	defer cancel()
+	if err := c.CheckEndpoint(checkCtx); err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Prepaid-Host API endpoint looks wrong",
+			"The endpoint \""+endpoint+"\" does not answer like the Prepaid-Host API, so nothing was read or changed. "+
+				"Check the provider attribute \"endpoint\" and the "+EnvEndpoint+" environment variable; the API base URL is "+
+				DefaultEndpoint+" (with /api).\n\n"+err.Error())
+		return
+	}
+
 	resp.DataSourceData = c
 	resp.ResourceData = c
 }

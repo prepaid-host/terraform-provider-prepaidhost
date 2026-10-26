@@ -4,7 +4,7 @@
 package testapi
 
 import (
-	"crypto/md5" //nolint:gosec // mirrors UserSshKey::generateFingerprint, not a security use
+	"crypto/md5" //nolint:gosec // the API's fingerprint format (MD5 of the key), not a security use
 	"encoding/base64"
 	"encoding/hex"
 	"net/http"
@@ -15,8 +15,7 @@ import (
 // ResourceSSHKey is the State.Resources type of SSH keys.
 const ResourceSSHKey = "ssh_key"
 
-// Mirrors AccountBillingController: GET/POST /account/ssh-keys and
-// DELETE /account/ssh-keys/{id}.
+// GET/POST /account/ssh-keys and DELETE /account/ssh-keys/{id} like the API.
 func init() {
 	register(func(s *Server) {
 		s.Handle(http.MethodGet, "/account/ssh-keys", handleListSSHKeys)
@@ -27,7 +26,7 @@ func init() {
 
 var sshKeyPrefixes = []string{"ssh-rsa", "ssh-ed25519", "ssh-dss", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521"}
 
-// SSHFingerprint is UserSshKey::generateFingerprint: the MD5 of the decoded key
+// SSHFingerprint is the API's key fingerprint: the MD5 of the decoded key
 // as colon-separated hex pairs ("" if the key has no decodable second field).
 func SSHFingerprint(publicKey string) string {
 	parts := strings.Fields(publicKey)
@@ -72,7 +71,7 @@ func handleCreateSSHKey(st *State, r *Request) Response {
 	publicKey, _ := body["public_key"].(string)
 	publicKey = strings.TrimSpace(publicKey)
 
-	// The default Laravel validation answer (Handler::invalidJson).
+	// The API's general validation answer (VALIDATION_ERROR with details).
 	details := map[string]any{}
 	if strings.TrimSpace(name) == "" {
 		details["name"] = []any{"The name field is required."}
@@ -120,7 +119,7 @@ func handleDeleteSSHKey(st *State, r *Request) Response {
 		return Fail(http.StatusNotFound, "NOT_FOUND", "Endpoint nicht gefunden.", nil)
 	}
 	if _, found := st.Resource(ResourceSSHKey, id); !found {
-		// abort(404) in the controller, rendered by Handler as NOT_FOUND.
+		// A missing key: 404 NOT_FOUND (the route exists).
 		return Fail(http.StatusNotFound, "NOT_FOUND", "Endpoint nicht gefunden.", nil)
 	}
 	delete(st.Resources[ResourceSSHKey], id)

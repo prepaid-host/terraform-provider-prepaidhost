@@ -15,7 +15,7 @@ The Prepaid-Host provider orders and manages [Prepaid-Host](https://prepaid-host
 1. **Create an API token with the order scopes** in the customer panel. Ordering needs `rootserver:order` for vServers and `domain:order` for domains; add the read scopes the resources list on their pages (for example `rootserver:read`, `domain:read`, `domain:dns:write`, `account:sshkeys`, `domain:contact`, `account:billing`).
 2. **Consent while creating the token.** An order token is created in the customer panel only, and creating it records your consent to the terms and conditions (AGB), the cancellation policy (Widerruf) and the immediate execution of orders. A token without this consent cannot order.
 3. **Top up the balance in the customer panel first.** The provider never tops up. If the balance is too short, the order is refused with `INSUFFICIENT_BALANCE` and the error names the missing amount. Nothing is charged and nothing is written to the state.
-4. **Keep the token secret.** Pass it with the `PREPAIDHOST_TOKEN` environment variable or a variable marked `sensitive = true`. The token is a sensitive provider argument, so it is masked in plan output, but Terraform and OpenTofu keep sensitive values in the state file in plain text. Protect the state: use an encrypted remote backend (OpenTofu can also encrypt state itself) and do not commit it. The vServer `password` is write-only (Terraform 1.11+ / OpenTofu 1.11+) and never stored in the state.
+4. **Keep the token secret.** Pass it with the `PREPAIDHOST_TOKEN` environment variable or a variable marked `sensitive = true`. The token is a sensitive provider argument: it is masked in plan output and is **not** stored in the state. A saved plan file (`plan -out=...`) does contain it when it comes from the configuration or a variable (not when it comes from `PREPAIDHOST_TOKEN`), so treat plan files like the token. The state holds the attributes of the resources in plain text, sensitive ones included (they are only masked in output), so protect it as well: use an encrypted remote backend (OpenTofu can also encrypt state and plan files itself) and do not commit it. The vServer `password` is write-only (Terraform 1.11+ / OpenTofu 1.11+) and stored neither in the state nor in plan files.
 
 ## Example usage
 
@@ -43,5 +43,9 @@ The `source` is valid for Terraform and OpenTofu:
 ### Cost protection
 
 Set `max_price` (in EUR) on `prepaidhost_vserver` and `prepaidhost_domain`. If the quote is higher, the order fails before anything is charged. The binding price is always the quote of the order; the `prepaidhost_catalog` data source shows indicative prices. The `prepaidhost_balance` data source reads the current balance (for example for a `precondition`).
+
+### Rate limits
+
+The API allows 60 requests per minute per account, and 10 per minute for price quotes and orders together. When a read, a quote or an order hits the limit, the provider waits as long as the API asks (`Retry-After`) and tries again, so a refresh of many resources gets slower, not broken. Other writes (for example DNS records or nameservers) are not repeated automatically; if one hits the limit, run apply again, or lower `-parallelism`.
 
 {{ .SchemaMarkdown | trimspace }}

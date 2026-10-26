@@ -8,6 +8,12 @@ Sources (read them again before the first release, the requirements change):
 - OpenTofu Registry: <https://github.com/opentofu/registry#readme> and the inclusion/immutability policy <https://github.com/opentofu/registry/blob/main/POLICY.md>
 - Provider scaffolding (source of the GoReleaser config and workflow): <https://github.com/hashicorp/terraform-provider-scaffolding-framework>
 
+## Before the first release
+
+- **The ordering API must be live in production first.** Ordering (`POST /orders/quote`, `POST /orders`, `GET /orders`) and the other endpoints the provider uses must be deployed on <https://prepaid-host.com/api>, and an order token with consent must be creatable in the customer panel. A published version cannot be withdrawn (see the OpenTofu policy below), so a provider released before its API exists stays broken forever.
+- **The one-time setup below must be complete before the first tag** — signing key and both secrets in GitHub, the provider added in the Terraform Registry. The tag is the release: without the secrets the workflow fails at the key import, and the Terraform Registry only ingests releases published after the provider was connected there.
+- **Rehearse in a private fork, not here.** Do a dress rehearsal of the whole pipeline in a private fork (or a throwaway repository) with a throwaway GPG key and its own secrets: tag `v0.0.1` there, check that the release is published with all assets and that the signature verifies (`gpg --verify ..._SHA256SUMS.sig ..._SHA256SUMS`). Do **not** rehearse with an `-rc` tag in this repository: a pre-release is a release too, and OpenTofu indexes it as an immutable version. Delete the throwaway key afterwards.
+
 ## One-time setup
 
 ### 1. Signing key (shared by both registries)
@@ -60,7 +66,7 @@ Their policy (<https://github.com/opentofu/registry/blob/main/POLICY.md>) matter
    git push origin vX.Y.Z
    ```
 
-   Pre-releases use a hyphen: `vX.Y.Z-rc1`.
+   Pre-releases use a hyphen: `vX.Y.Z-rc1` — they are published and immutable like any other version, so they are no way to test the pipeline (use the private fork, see above). The workflow refuses a tag whose commit is not on `main`, and runs the tests once more before it builds.
 6. Watch the **Release** action. It must end green and the GitHub release must be **published** (not a draft) with these assets: the zips `terraform-provider-prepaidhost_X.Y.Z_{os}_{arch}.zip`, `..._SHA256SUMS`, `..._SHA256SUMS.sig` (binary signature), `..._manifest.json` (protocol 6.0).
 7. Check the registry pages: the new version at <https://registry.terraform.io/providers/prepaid-host/prepaidhost> (takes a few minutes; Resync if it does not appear) and, once the provider is approved there, on <https://search.opentofu.org>.
 8. Smoke test in an empty directory, with both tools:

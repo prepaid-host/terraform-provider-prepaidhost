@@ -28,6 +28,10 @@ func describeError(err error) string {
 	}
 	var b strings.Builder
 	b.WriteString(apiErr.Error())
+	if client.IsThrottled(err) {
+		b.WriteString("\n\nThe API's rate limit was reached. Wait a minute and run again; " +
+			"fewer parallel operations (-parallelism) keep below the limit.")
+	}
 	for _, key := range []string{"fields", "details"} {
 		if v, ok := apiErr.Extra[key]; ok && v != nil {
 			b.WriteString("\n\n")
@@ -39,7 +43,7 @@ func describeError(err error) string {
 	return b.String()
 }
 
-// formatFields renders a Laravel error bag ({"field": ["message", ...]}) one field per line.
+// formatFields renders the API's validation error map ({"field": ["message", ...]}) one field per line.
 func formatFields(v any) string {
 	m, ok := v.(map[string]any)
 	if !ok {

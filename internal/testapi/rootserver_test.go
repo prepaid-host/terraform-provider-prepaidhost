@@ -58,7 +58,7 @@ func customItem(host string) map[string]any {
 	}
 }
 
-// GET /rootserver/{id} has exactly the columns RootserverController::show selects.
+// GET /rootserver/{id} has exactly the fields the API answers.
 func TestRootserver_ShowAfterOrder(t *testing.T) {
 	api := testapi.New(t)
 	id := placeServer(t, api, customItem("web1"))
@@ -81,7 +81,7 @@ func TestRootserver_ShowAfterOrder(t *testing.T) {
 	}
 
 	// Polling the order until active marks the server installed (the API derives
-	// the item status from vServer::installed).
+	// the item status from the server being installed).
 	for _, oid := range api.OrderIDs() {
 		call(t, api, http.MethodGet, "/orders/"+oid, api.Token, nil, nil)
 		call(t, api, http.MethodGet, "/orders/"+oid, api.Token, nil, nil)

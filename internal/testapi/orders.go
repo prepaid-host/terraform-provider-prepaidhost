@@ -16,8 +16,8 @@ import (
 	"time"
 )
 
-// Order endpoints, modelled on app/Http/Controllers/Api/OrderController.php
-// and OrderPlacementService: POST /orders/quote, POST /orders, GET /orders/{uuid}.
+// Order endpoints, modelled on the API's ordering: POST /orders/quote,
+// POST /orders, GET /orders and GET /orders/{uuid}.
 func init() {
 	register(func(s *Server) {
 		s.Handle(http.MethodPost, "/orders/quote", handleQuote)
@@ -106,8 +106,8 @@ func parseOrder(r *Request, placing bool) (*orderBody, *Response) {
 	return &body, nil
 }
 
-// invalidField is OrderingException::invalid — one field in "field", unlike the
-// FormRequest validation which lists "fields".
+// invalidField is the API's order-specific rejection — one field in "field",
+// unlike the request validation which lists "fields".
 func invalidField(field, message string) Response {
 	return Fail(http.StatusUnprocessableEntity, "VALIDATION_FAILED", message, map[string]any{"field": field})
 }
@@ -221,7 +221,8 @@ func handleQuote(st *State, r *Request) Response {
 	})
 }
 
-// requestHash fingerprints the body like OrderPlacementService::requestHash:
+// requestHash fingerprints the body the way the API compares two requests
+// with the same Idempotency-Key:
 // items with sorted keys (json.Marshal sorts map keys), expected_total with
 // two decimals, promo_code trimmed with "" meaning absent.
 func requestHash(body *orderBody) string {
@@ -342,7 +343,7 @@ func (st *State) referenceInUse(ref string) (string, int64, bool) {
 	return "", 0, false
 }
 
-// present renders the order like OrderPlacementService::present. A poll
+// present renders the order like the API. A poll
 // advances the simulated provisioning by one step.
 func (o *Order) present(st *State, poll bool) map[string]any {
 	status := "provisioning"
@@ -365,7 +366,7 @@ func (o *Order) present(st *State, poll bool) map[string]any {
 			// The API reports an item whose resource no longer exists as failed.
 			s = "failed"
 		} else if s == "active" && it.ResourceType == ResourceRootserver {
-			// The API derives a server item's status from vServer::installed.
+			// The API derives a server item's status from the server being installed.
 			attrs["installed"] = true
 		}
 		if statusRank[s] > statusRank[overall] {
@@ -400,7 +401,7 @@ func handleGetOrder(st *State, r *Request) Response {
 	return OK(o.present(st, true))
 }
 
-// handleListOrders is OrderController::index: the account's orders, newest
+// handleListOrders is GET /orders: the account's orders, newest
 // first, paginated (page, per_page up to 100). Listing does not advance the
 // simulated provisioning.
 func handleListOrders(st *State, r *Request) Response {

@@ -164,7 +164,7 @@ func TestDomainNameservers(t *testing.T) {
 		t.Errorf("default nameservers = %+v", got)
 	}
 
-	// Normalised like UpdateNameserversRequest::normaliseNameservers.
+	// Normalised like the API does before validating.
 	resp, env := call(t, api, http.MethodPut, p, api.Token, map[string]any{"nameservers": []any{" NS1.Example.COM. ", "ns2.example.com", "ns2.example.com"}}, nil)
 	_ = json.Unmarshal(env.Result, &got)
 	if resp.StatusCode != http.StatusOK || fmt.Sprint(got.Nameservers) != "[ns1.example.com ns2.example.com]" {
@@ -301,7 +301,7 @@ func TestDNSRecords(t *testing.T) {
 		t.Errorf("delete twice: %d %v", resp.StatusCode, env.Error)
 	}
 
-	// Unknown domain: findOrFail → NOT_FOUND.
+	// Unknown domain: 404 NOT_FOUND.
 	resp, env = call(t, api, http.MethodGet, "/domain/424242/dns", api.Token, nil, nil)
 	if resp.StatusCode != http.StatusNotFound || env.Error["code"] != "NOT_FOUND" {
 		t.Errorf("unknown domain: %d %v", resp.StatusCode, env.Error)

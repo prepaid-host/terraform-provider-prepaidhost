@@ -5,6 +5,9 @@ package provider
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 
 	"github.com/prepaid-host/terraform-provider-prepaidhost/internal/client"
+	"github.com/prepaid-host/terraform-provider-prepaidhost/internal/testapi"
 )
 
 // testAccProtoV6ProviderFactories starts the provider in-process for terraform-plugin-testing.
@@ -191,6 +195,44 @@ func TestConfigure_PlainHTTPWarnsForRemoteHost(t *testing.T) {
 		if resp.ResourceData == nil {
 			t.Errorf("%s: warning must not block the client", ep)
 		}
+	}
+}
+
+// A wrong endpoint fails at Configure, before any Read could take its 404
+// answers for deleted resources.
+func TestConfigure_WrongEndpointFailsFast(t *testing.T) {
+	t.Setenv(EnvToken, "")
+	api := testapi.New(t)
+	html := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "<html><body>Prepaid-Host</body></html>")
+	}))
+	defer html.Close()
+
+	for name, ep := range map[string]string{
+		"route missing (ENDPOINT_NOT_FOUND)": api.URL + "/v1",
+		"web page instead of the API":        html.URL,
+	} {
+		resp := configure(t, ptr(api.Token), ptr(ep))
+		if !resp.Diagnostics.HasError() {
+			t.Errorf("%s: want an error", name)
+			continue
+		}
+		d := resp.Diagnostics.Errors()[0]
+		if d.Summary() != "Prepaid-Host API endpoint looks wrong" || !strings.Contains(d.Detail(), ep) || !strings.Contains(d.Detail(), "/api") {
+			t.Errorf("%s: diagnostic = %q / %q", name, d.Summary(), d.Detail())
+		}
+		if resp.ResourceData != nil {
+			t.Errorf("%s: no client on error", name)
+		}
+	}
+
+	resp := configure(t, ptr(api.Token), ptr(api.URL))
+	if resp.Diagnostics.HasError() || resp.ResourceData == nil {
+		t.Fatalf("right endpoint: %v", resp.Diagnostics)
+	}
+	if n := api.CallCount(http.MethodGet, "/catalog"); n != 1 {
+		t.Errorf("GET /catalog = %d, want the one check", n)
 	}
 }
 

@@ -119,7 +119,7 @@ func TestAccDomain_Register(t *testing.T) {
 				it := lastOrderItem(t, d.api)
 				want := []string{"action", "client_reference", "contact_id", "duration_months", "sld", "tld", "type"}
 				if got := keysOf(it); fmt.Sprint(got) != fmt.Sprint(want) {
-					return fmt.Errorf("item fields = %v, want %v (the API's INPUT_KEYS for domain, no authcode)", got, want)
+					return fmt.Errorf("item fields = %v, want %v (the item fields the API evaluates for a domain, no authcode)", got, want)
 				}
 				if it["type"] != "domain" || it["sld"] != "example" || it["tld"] != "de" || it["client_reference"] != "example.de" ||
 					it["action"] != "register" || it["duration_months"] != float64(12) || it["contact_id"] != float64(d.contact) {
@@ -960,5 +960,47 @@ func TestDomain_ReadKeepsProvisioningUntilActive(t *testing.T) {
 	}
 	if stateString(t, resp, "expires_at") == "" {
 		t.Errorf("expires_at must be read together with the status")
+	}
+}
+
+// When the orders cannot be read, Read keeps the last known "provisioning"
+// and warns, instead of taking "unknown" for "active".
+func TestDomain_ReadKeepsProvisioningWhenOrdersUnreadable(t *testing.T) {
+	d := newDomainTest(t)
+	id := d.api.SeedDomain(map[string]any{"client_reference": "example.de"})
+	d.api.SeedOrder("domain", testapi.ResourceDomain, id, "example.de", "provisioning")
+	d.api.InjectResponse(http.MethodGet, "/orders", 10,
+		testapi.Fail(http.StatusInternalServerError, "INTERNAL_ERROR", "Ein unerwarteter Fehler ist aufgetreten.", nil))
+
+	sch := domainSchema(t)
+	vals := d.values()
+	vals["id"] = str(strconv.FormatInt(id, 10))
+	vals["status"] = str("provisioning")
+	state := tfsdk.State{Schema: sch.Schema, Raw: tfValue(t, sch, vals, true)}
+	resp := resource.ReadResponse{State: state}
+	d.resource().Read(context.Background(), resource.ReadRequest{State: state}, &resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("read: %v", resp.Diagnostics)
+	}
+	if got := stateString(t, resp, "status"); got != "provisioning" || !hasWarning(resp.Diagnostics, "Could not check the domain's order") {
+		t.Errorf("status = %q, diags = %v", got, resp.Diagnostics)
+	}
+}
+
+// Adopting a domain while the orders cannot be read warns that its status
+// could not be checked.
+func TestDomain_AdoptionWarnsWhenOrdersUnreadable(t *testing.T) {
+	d := newDomainTest(t)
+	existing := d.api.SeedDomain(map[string]any{"client_reference": "example.de"})
+	d.api.SeedOrder("domain", testapi.ResourceDomain, existing, "example.de", "provisioning")
+	d.api.InjectResponse(http.MethodGet, "/orders", 10,
+		testapi.Fail(http.StatusInternalServerError, "INTERNAL_ERROR", "Ein unerwarteter Fehler ist aufgetreten.", nil))
+	resp := d.createDirect(t, nil)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("create: %v", resp.Diagnostics)
+	}
+	if !hasWarning(resp.Diagnostics, "Could not check the domain's order") {
+		t.Errorf("want the warning, got %v", resp.Diagnostics)
 	}
 }

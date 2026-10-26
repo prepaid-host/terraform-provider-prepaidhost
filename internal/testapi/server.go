@@ -10,8 +10,12 @@
 // package registers its endpoints in an init function via register, so a new
 // endpoint is a new handler plus one Handle call. Tests can additionally
 // override routes (Handle), queue canned responses or dropped connections
-// for a route (InjectResponse) and inspect the requests made (CallCount,
-// Requests).
+// for a route (InjectResponse), switch on the API's rate limits (Throttle,
+// ThrottleRoutes) and inspect the requests made (CallCount, Requests).
+//
+// Like the real API, a path without a route answers 404 ENDPOINT_NOT_FOUND
+// (a path that exists for another method: 405 METHOD_NOT_ALLOWED); a
+// resource that does not exist answers 404 NOT_FOUND.
 package testapi
 
 import (
@@ -150,6 +154,41 @@ type route struct {
 	handler HandlerFunc
 }
 
+// limiter is a fixed-window rate limit like the API's: the window starts with
+// the first request, and once limit requests were let through, every further
+// one is refused until the window has passed.
+type limiter struct {
+	limit  int
+	window time.Duration
+	// routes limits the limiter to "METHOD /pattern" keys; nil = all requests.
+	routes map[string]bool
+
+	start time.Time
+	count int
+}
+
+// allow counts a request and returns how long to wait when it is refused.
+func (l *limiter) allow(now time.Time) (bool, time.Duration) {
+	if l.start.IsZero() || now.Sub(l.start) >= l.window {
+		l.start, l.count = now, 0
+	}
+	if l.count >= l.limit {
+		return false, l.window - now.Sub(l.start)
+	}
+	l.count++
+	return true, 0
+}
+
+// tooManyRequests is the API's 429 answer, with Retry-After in whole seconds
+// (rounded up) like the API.
+func tooManyRequests(limit int, wait time.Duration) Response {
+	secs := int(math.Ceil(wait.Seconds()))
+	return Fail(http.StatusTooManyRequests, "TOO_MANY_REQUESTS", "Zu viele Anfragen.", nil).
+		WithHeader("Retry-After", strconv.Itoa(max(secs, 1))).
+		WithHeader("X-RateLimit-Limit", strconv.Itoa(limit)).
+		WithHeader("X-RateLimit-Remaining", "0")
+}
+
 type injected struct {
 	remaining int
 	resp      Response
@@ -168,6 +207,10 @@ type Server struct {
 	routes   []*route
 	inject   map[string][]*injected
 	requests []RecordedRequest
+
+	throttle       *limiter
+	routeThrottles []*limiter
+	throttled      int
 }
 
 // registrations are the default endpoints; files of this package add theirs in init().
@@ -216,6 +259,39 @@ func (s *Server) InjectResponse(method, path string, times int, resp Response) {
 	defer s.mu.Unlock()
 	key := method + " " + normalize(path)
 	s.inject[key] = append(s.inject[key], &injected{remaining: times, resp: resp})
+}
+
+// Throttle limits all requests to limit per window, like the API's general
+// limit (60 per minute). A refused request answers 429 TOO_MANY_REQUESTS with
+// Retry-After. limit <= 0 switches the limit off again.
+func (s *Server) Throttle(limit int, window time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.throttle = nil
+	if limit > 0 {
+		s.throttle = &limiter{limit: limit, window: window}
+	}
+}
+
+// ThrottleRoutes adds a limit shared by the given routes ("METHOD /pattern",
+// e.g. "POST /orders/quote"), like the API's order limit (10 per minute for
+// quote and order together). It applies in addition to Throttle.
+func (s *Server) ThrottleRoutes(limit int, window time.Duration, routes ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := map[string]bool{}
+	for _, r := range routes {
+		method, pattern, _ := strings.Cut(r, " ")
+		keys[method+" "+normalize(pattern)] = true
+	}
+	s.routeThrottles = append(s.routeThrottles, &limiter{limit: limit, window: window, routes: keys})
+}
+
+// ThrottledCount counts the requests refused with 429 by Throttle or ThrottleRoutes.
+func (s *Server) ThrottledCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.throttled
 }
 
 // With runs fn with the state locked — for seeding or inspecting anything the
@@ -279,20 +355,45 @@ func (s *Server) serveHTTP(w http.ResponseWriter, hr *http.Request) {
 }
 
 func (s *Server) dispatch(hr *http.Request, rt *route, path string, params map[string]string, body []byte) (resp Response) {
+	if rt == nil {
+		// No route matched, so no route middleware (limit, token check) runs —
+		// like the real API. An injected response still wins.
+		if inj, ok := s.takeInjected(hr.Method, path); ok && !inj.afterHandler {
+			return inj
+		}
+		if s.pathExists(path) {
+			return Fail(http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", fmt.Sprintf("no route for %s %s", hr.Method, path), nil)
+		}
+		return Fail(http.StatusNotFound, "ENDPOINT_NOT_FOUND", fmt.Sprintf("no route for %s %s", hr.Method, path), nil)
+	}
+
+	now := time.Now()
+	// The general limit runs first (middleware of the whole API group).
+	if s.throttle != nil {
+		if ok, wait := s.throttle.allow(now); !ok {
+			s.throttled++
+			return tooManyRequests(s.throttle.limit, wait)
+		}
+	}
 	if hr.Header.Get("Authorization") != "Bearer "+s.Token {
 		return Fail(http.StatusUnauthorized, "UNAUTHENTICATED", "Unauthenticated.", nil)
 	}
+	for _, l := range s.routeThrottles {
+		if !l.routes[hr.Method+" "+rt.pattern] {
+			continue
+		}
+		if ok, wait := l.allow(now); !ok {
+			s.throttled++
+			return tooManyRequests(l.limit, wait)
+		}
+	}
 
 	inj, injectedOK := s.takeInjected(hr.Method, path)
-	if !injectedOK && rt != nil {
+	if !injectedOK {
 		inj, injectedOK = s.takeInjected(hr.Method, rt.pattern)
 	}
 	if injectedOK && !inj.afterHandler {
 		return inj
-	}
-
-	if rt == nil {
-		return Fail(http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("no route for %s %s", hr.Method, path), nil)
 	}
 
 	defer func() {
@@ -324,6 +425,16 @@ func (s *Server) takeInjected(method, path string) (Response, bool) {
 	}
 	delete(s.inject, key)
 	return Response{}, false
+}
+
+// pathExists reports whether any method has a route for path.
+func (s *Server) pathExists(path string) bool {
+	for _, r := range s.routes {
+		if rt, _ := s.match(r.method, path); rt != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) match(method, path string) (*route, map[string]string) {

@@ -54,7 +54,7 @@ var (
 
 const (
 	defaultDNSTTL = 300
-	// codeDNSRejected is DomainController::dnsError for a 422 (also an unknown record id).
+	// codeDNSRejected is the API's answer (422) to a record it rejects — also to an unknown record id.
 	codeDNSRejected = "DNS_RECORD_REJECTED"
 )
 
@@ -72,7 +72,7 @@ type dnsRecordModel struct {
 	Port     types.Int64  `tfsdk:"port"`
 }
 
-// dnsRecordAPI is one record as DnsRecordService::normalise presents it.
+// dnsRecordAPI is one record as GET /domain/{id}/dns presents it.
 type dnsRecordAPI struct {
 	ID       *flexInt `json:"id"`
 	Type     string   `json:"type"`

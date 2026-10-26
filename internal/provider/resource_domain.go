@@ -307,8 +307,8 @@ func (r *domainResource) Configure(_ context.Context, req resource.ConfigureRequ
 
 // ---- order item ----
 
-// orderItem is exactly the API's domain INPUT_KEYS that are set; the engine
-// adds client_reference (= name).
+// orderItem is exactly the domain item fields the API evaluates, as far as
+// they are set; the engine adds client_reference (= name).
 func (m *domainModel) orderItem() map[string]any {
 	sld, tld := splitDomainName(m.Name.ValueString())
 	item := map[string]any{
@@ -487,7 +487,14 @@ func (r *domainResource) Create(ctx context.Context, req resource.CreateRequest,
 	// finished: paid, but not active yet.
 	pendingStatus := ""
 	if outcome == orderReferenceInUse {
-		if pendingStatus = pendingItemStatus(pctx, r.client, "domain", resourceID); pendingStatus != "" {
+		var perr error
+		pendingStatus, perr = pendingItemStatus(pctx, r.client, "domain", resourceID)
+		switch {
+		case perr != nil:
+			resp.Diagnostics.AddWarning("Could not check the domain's order",
+				fmt.Sprintf("The orders could not be read to check whether the order of domain %s (%s) is finished, so its status "+
+					"is taken as %q. The next refresh checks again.\n\n%s", id, name, statusActive, describeError(perr)))
+		case pendingStatus != "":
 			resp.Diagnostics.AddWarning("Domain paid but not yet active",
 				fmt.Sprintf("The order item of domain %s (%s) has the status %q, not \"active\": the domain is paid but not yet "+
 					"registered. The status stays %q until a refresh sees it active — contact support if it stays so.",
@@ -591,7 +598,15 @@ func (r *domainResource) Read(ctx context.Context, req resource.ReadRequest, res
 	if previousStatus == statusProvisioning || previousStatus == client.StatusFailed {
 		// Taken over while its order was not active: keep saying so until it is.
 		if rid, perr := strconv.ParseInt(id, 10, 64); perr == nil {
-			if pending := pendingItemStatus(ctx, r.client, "domain", rid); pending != "" {
+			pending, perr := pendingItemStatus(ctx, r.client, "domain", rid)
+			switch {
+			case perr != nil:
+				// Unknown is not active: keep the last known status.
+				state.Status = types.StringValue(previousStatus)
+				resp.Diagnostics.AddWarning("Could not check the domain's order",
+					fmt.Sprintf("The orders could not be read, so the status of domain %s (%s) keeps its last known value %q. "+
+						"The next refresh checks again.\n\n%s", id, name, previousStatus, describeError(perr)))
+			case pending != "":
 				state.Status = types.StringValue(pending)
 				resp.Diagnostics.AddWarning("Domain paid but not yet active",
 					fmt.Sprintf("The order item of domain %s (%s) still has the status %q — contact support if it stays so.", id, name, pending))

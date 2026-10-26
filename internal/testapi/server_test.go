@@ -88,11 +88,82 @@ func TestBalance(t *testing.T) {
 	}
 }
 
+// A path without a route is ENDPOINT_NOT_FOUND like the real API — also
+// without a token, since no route middleware runs — and a resource that does
+// not exist stays NOT_FOUND.
 func TestUnknownRoute(t *testing.T) {
 	api := testapi.New(t)
-	resp, env := call(t, api, http.MethodGet, "/nope", api.Token, nil, nil)
-	if resp.StatusCode != http.StatusNotFound || env.Success {
-		t.Errorf("status=%d env=%+v", resp.StatusCode, env)
+	for _, token := range []string{api.Token, ""} {
+		resp, env := call(t, api, http.MethodGet, "/nope", token, nil, nil)
+		if resp.StatusCode != http.StatusNotFound || env.Success || env.Error["code"] != "ENDPOINT_NOT_FOUND" {
+			t.Errorf("token %q: status=%d env=%+v", token, resp.StatusCode, env)
+		}
+	}
+	resp, env := call(t, api, http.MethodGet, "/rootserver/999", api.Token, nil, nil)
+	if env.Error["code"] == "ENDPOINT_NOT_FOUND" {
+		t.Errorf("missing resource: status=%d env=%+v", resp.StatusCode, env)
+	}
+	resp, env = call(t, api, http.MethodPatch, "/account/balance", api.Token, nil, nil)
+	if resp.StatusCode != http.StatusMethodNotAllowed || env.Error["code"] != "METHOD_NOT_ALLOWED" {
+		t.Errorf("wrong method: status=%d env=%+v", resp.StatusCode, env)
+	}
+}
+
+func TestThrottle(t *testing.T) {
+	api := testapi.New(t)
+	api.Throttle(2, time.Hour)
+	for i := range 2 {
+		if resp, _ := call(t, api, http.MethodGet, "/account/balance", api.Token, nil, nil); resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status=%d", i, resp.StatusCode)
+		}
+	}
+	resp, env := call(t, api, http.MethodGet, "/account/balance", api.Token, nil, nil)
+	if resp.StatusCode != http.StatusTooManyRequests || env.Error["code"] != "TOO_MANY_REQUESTS" {
+		t.Fatalf("status=%d env=%+v", resp.StatusCode, env)
+	}
+	if ra, err := strconv.Atoi(resp.Header.Get("Retry-After")); err != nil || ra < 3500 || ra > 3600 {
+		t.Errorf("Retry-After = %q, want the rest of the window in seconds", resp.Header.Get("Retry-After"))
+	}
+	if api.ThrottledCount() != 1 {
+		t.Errorf("ThrottledCount = %d", api.ThrottledCount())
+	}
+	api.Throttle(0, 0)
+	if resp, _ := call(t, api, http.MethodGet, "/account/balance", api.Token, nil, nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("after switching off: status=%d", resp.StatusCode)
+	}
+}
+
+func TestThrottle_WindowResets(t *testing.T) {
+	api := testapi.New(t)
+	api.Throttle(1, 200*time.Millisecond)
+	call(t, api, http.MethodGet, "/account/balance", api.Token, nil, nil)
+	if resp, _ := call(t, api, http.MethodGet, "/account/balance", api.Token, nil, nil); resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want 429", resp.StatusCode)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if resp, _ := call(t, api, http.MethodGet, "/account/balance", api.Token, nil, nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("after the window: status=%d", resp.StatusCode)
+	}
+}
+
+// The order limit is shared by quote and order and leaves other routes alone.
+func TestThrottleRoutes(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	api.ThrottleRoutes(1, time.Hour, "POST /orders/quote", "POST /orders")
+	body := map[string]any{"items": []any{item("web1")}}
+	if resp, _ := call(t, api, http.MethodPost, "/orders/quote", api.Token, body, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("quote: status=%d", resp.StatusCode)
+	}
+	resp, env := call(t, api, http.MethodPost, "/orders", api.Token, body, map[string]string{"Idempotency-Key": "tf-throttled-1"})
+	if resp.StatusCode != http.StatusTooManyRequests || env.Error["code"] != "TOO_MANY_REQUESTS" || resp.Header.Get("Retry-After") == "" {
+		t.Errorf("order: status=%d env=%+v", resp.StatusCode, env)
+	}
+	if resp, _ := call(t, api, http.MethodGet, "/account/balance", api.Token, nil, nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("balance: status=%d", resp.StatusCode)
+	}
+	if api.ChargeCount() != 0 {
+		t.Errorf("a refused order must not charge")
 	}
 }
 
@@ -394,7 +465,7 @@ func TestPlaceOrder_SlowOrderAnswersInProgressThenReplays(t *testing.T) {
 		t.Fatalf("first: status=%d", resp.StatusCode)
 	}
 	for i := 0; i < 2; i++ {
-		// In progress wins over a different body, as in OrderPlacementService.
+		// In progress wins over a different body, as in the API.
 		other := map[string]any{"items": []any{item("web2")}, "expected_total": 9.99}
 		resp, env := call(t, api, http.MethodPost, "/orders", api.Token, other, key)
 		if resp.StatusCode != http.StatusConflict || env.Error["code"] != "IDEMPOTENCY_IN_PROGRESS" {
@@ -421,7 +492,7 @@ func TestPlaceOrder_SlowOrderAnswersInProgressThenReplays(t *testing.T) {
 	}
 }
 
-// The request fingerprint is normalised like OrderPlacementService::requestHash:
+// The request fingerprint is normalised like the API's:
 // expected_total to two decimals, promo_code trimmed and "" = absent.
 func TestPlaceOrder_FingerprintIsNormalised(t *testing.T) {
 	api := testapi.New(t)

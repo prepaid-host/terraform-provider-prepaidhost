@@ -272,6 +272,56 @@ func TestOrderResource_InProgressTwiceThenSuccess(t *testing.T) {
 	}
 }
 
+// throttled is the API's 429 without Retry-After (the client then backs off
+// for its short test interval).
+func throttled() testapi.Response {
+	return testapi.Fail(http.StatusTooManyRequests, client.CodeTooManyRequests, "Zu viele Anfragen.", nil)
+}
+
+// The rate limit between the IDEMPOTENCY_IN_PROGRESS retries is waited out:
+// same key, charged once.
+func TestOrderResource_ThrottledWhileInProgress(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	api.InjectResponse(http.MethodPost, "/orders", 1,
+		testapi.Fail(http.StatusConflict, client.CodeIdempotencyInProgress, "Eine Anfrage mit diesem Idempotency-Key läuft noch.", nil))
+	api.InjectResponse(http.MethodPost, "/orders", 2, throttled())
+	api.InjectResponse(http.MethodPost, "/orders", 1,
+		testapi.Fail(http.StatusConflict, client.CodeIdempotencyInProgress, "Eine Anfrage mit diesem Idempotency-Key läuft noch.", nil))
+	api.InjectResponse(http.MethodPost, "/orders", 1, throttled().WithHeader("Retry-After", "1"))
+	c := orderTestClient(api)
+
+	id, _, diags := orderResource(context.Background(), c, serverItem(), "web1", nil, orderTestTimeout, orderOptions{})
+	requireNoErrors(t, diags)
+	if id == 0 || api.ChargeCount() != 1 {
+		t.Fatalf("id = %d, charges = %d", id, api.ChargeCount())
+	}
+	keys := orderKeys(api)
+	if len(keys) != 6 {
+		t.Fatalf("POST /orders = %d, want 6", len(keys))
+	}
+	for i, k := range keys {
+		if k != keys[0] {
+			t.Errorf("request %d used key %q, want %q", i, k, keys[0])
+		}
+	}
+}
+
+// The order limit of the API (shared by quote and order) is waited out
+// through its Retry-After.
+func TestOrderResource_OrderLimitIsWaitedOut(t *testing.T) {
+	api := testapi.New(t)
+	api.SetBalance(100)
+	api.ThrottleRoutes(1, time.Second, "POST /orders/quote", "POST /orders")
+	c := orderTestClient(api)
+
+	id, _, diags := orderResource(context.Background(), c, serverItem(), "web1", nil, orderTestTimeout, orderOptions{})
+	requireNoErrors(t, diags)
+	if id == 0 || api.ChargeCount() != 1 || api.ThrottledCount() == 0 {
+		t.Fatalf("id = %d, charges = %d, throttled = %d", id, api.ChargeCount(), api.ThrottledCount())
+	}
+}
+
 // A POST that outlives the HTTP timeout: the first request is charged but its
 // answer is lost, the retries see IDEMPOTENCY_IN_PROGRESS until the first
 // request finished, then the order is replayed — charged once, one key.
@@ -511,6 +561,11 @@ func TestOrderResource_ErrorDiagnostics(t *testing.T) {
 		// broken keep-alive connection, so inject more drops than client attempts.
 		{"network", "/orders", testapi.DropConnection(), 20,
 			[]string{"Run apply again", "will not be bought twice"}},
+		// The rate limit outlasts every wait (1 + 10 attempts).
+		{"order throttled", "/orders", throttled(), 20,
+			[]string{"Order outcome unknown", "rate limit", "will not be bought twice", "TOO_MANY_REQUESTS"}},
+		{"quote throttled", "/orders/quote", throttled(), 20,
+			[]string{"Price quote failed", "TOO_MANY_REQUESTS", "rate limit", "-parallelism"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -640,7 +695,7 @@ func TestIdempotencyKey_OtherFieldsKeepTheKey(t *testing.T) {
 		"hostname":         "renamed.example.com",
 		"client_reference": "ignored-the-argument-counts",
 		"unknown_field":    true,
-		"promo_code":       "IGNORED-FOR-ROOTSERVER", // the API drops it (INPUT_KEYS)
+		"promo_code":       "IGNORED-FOR-ROOTSERVER", // the API ignores it for a rootserver
 		"duration_months":  12,                       // rootserver uses duration_days
 	} {
 		item := serverItem()
@@ -974,9 +1029,8 @@ func TestOrderOutcome_String(t *testing.T) {
 	}
 }
 
-// Task 6 follow-up: the term of a rootserver ends after the months
-// RootserverFulfiller maps duration_days to (30→1, 90→3, 180→6, 365→12),
-// added as calendar months like Carbon::addMonths.
+// The term of a rootserver ends after the months the API rents for its
+// duration_days (30→1, 90→3, 180→6, 365→12), added as calendar months.
 func TestTermOver_RootserverDaysAreMonths(t *testing.T) {
 	at := func(s string) time.Time {
 		v, err := time.Parse(time.RFC3339, s)

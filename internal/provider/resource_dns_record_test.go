@@ -278,7 +278,7 @@ func TestAccDNSRecord_DomainGone(t *testing.T) {
 	)
 }
 
-// The FormRequests' rules, checked at plan time.
+// The API's validation rules for records, checked at plan time.
 func TestAccDNSRecord_Validation(t *testing.T) {
 	d := newDNSTest(t)
 	cases := map[string]struct {
@@ -386,4 +386,40 @@ func TestDNSRecord_DeleteOfGoneRecordSucceeds(t *testing.T) {
 	if !resp.Diagnostics.HasError() {
 		t.Errorf("a provider outage must fail the delete")
 	}
+}
+
+// A refresh of many resources runs into the API's general rate limit (here
+// scaled down to 10 requests per second) and recovers by waiting for
+// Retry-After instead of failing.
+func TestAccDNSRecord_RefreshUnderRateLimit(t *testing.T) {
+	d := newDNSTest(t)
+	cfg := providerConfig(d.api) + fmt.Sprintf(`
+resource "prepaidhost_dns_record" "many" {
+  count     = 15
+  domain_id = %d
+  type      = "A"
+  host      = "host${count.index}"
+  record    = "192.0.2.${count.index + 1}"
+}
+`, d.domain)
+	tfresource.Test(t, tfresource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []tfresource.TestStep{
+			{Config: cfg},
+			{
+				PreConfig: func() { d.api.Throttle(10, time.Second) },
+				Config:    cfg,
+				Check: func(*terraform.State) error {
+					if d.api.ThrottledCount() == 0 {
+						return fmt.Errorf("the limit never refused a request; the test proves nothing")
+					}
+					return nil
+				},
+			},
+			{RefreshState: true},
+			// Writes are never retried on 429: lift the limit for the destroy.
+			{PreConfig: func() { d.api.Throttle(0, 0) }, Config: cfg},
+		},
+	})
 }

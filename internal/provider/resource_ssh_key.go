@@ -5,7 +5,7 @@ package provider
 
 import (
 	"context"
-	"crypto/md5" //nolint:gosec // the API's fingerprint format (UserSshKey::generateFingerprint), not a security use
+	"crypto/md5" //nolint:gosec // the API's fingerprint format (MD5 of the key), not a security use
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"

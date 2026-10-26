@@ -1,6 +1,9 @@
 # Release pipeline (HashiCorp provider scaffolding). Runs ONLY for a pushed tag
 # `v*` (e.g. v0.1.0) — nothing else publishes anything. See RELEASING.md.
 #
+# Before anything is built, the job checks that the tagged commit is on main
+# and runs the tests (unit and mock-API) for exactly that commit.
+#
 # GoReleaser builds the provider for all platforms, zips it, writes the
 # SHA256SUMS file, signs that file with a detached binary GPG signature
 # (.sig) and uploads everything, plus terraform-registry-manifest.json, to a
@@ -31,10 +34,23 @@ jobs:
         with:
           # GoReleaser needs the tags to derive the version.
           fetch-depth: 0
+      # A tag on a commit that never reached main (a branch, a fork) is not
+      # released: everything published is immutable.
+      - name: Require the tagged commit to be on main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main. Tag a commit of main."
+            exit 1
+          fi
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: 'go.mod'
           cache: true
+      # The unit tests and the mock-API tests (no TF_ACC) must pass for the
+      # exact tagged commit before anything is signed or published.
+      - name: Test
+        run: go test -race ./...
       - name: Import GPG key
         id: import_gpg
         uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0

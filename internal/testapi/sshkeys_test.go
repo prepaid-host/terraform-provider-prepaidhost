@@ -24,7 +24,7 @@ func TestSSHKeys_CreateListDelete(t *testing.T) {
 	if err := json.Unmarshal(env.Result, &key); err != nil {
 		t.Fatal(err)
 	}
-	// Exactly the fields of AccountBillingController::storeSshKey — no public_key echoed.
+	// Exactly the fields the API answers on create — no public_key echoed.
 	for _, k := range []string{"id", "name", "fingerprint", "provision_on_reinstall", "created_at"} {
 		if _, ok := key[k]; !ok {
 			t.Errorf("missing %q in %v", k, key)

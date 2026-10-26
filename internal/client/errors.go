@@ -26,6 +26,12 @@ const (
 	CodeInsufficientScope     = "INSUFFICIENT_SCOPE"
 	CodeDuplicateContact      = "DUPLICATE_CONTACT"
 	CodeUnauthenticated       = "UNAUTHENTICATED"
+	CodeTooManyRequests       = "TOO_MANY_REQUESTS"
+	// CodeEndpointNotFound is the answer to a path the API has no route for
+	// (HTTP 404) — a wrong endpoint or an API without that route, never a
+	// missing resource. A resource that does not exist is NOT_FOUND (or a
+	// more specific *_NOT_FOUND code).
+	CodeEndpointNotFound = "ENDPOINT_NOT_FOUND"
 )
 
 // APIError is a failed API call: either the error envelope
@@ -111,11 +117,12 @@ func IsCode(err error, code string) bool {
 // Only answers of the API itself count (Enveloped): HTTP 404 with an envelope,
 // or the legacy endpoints' {"success":false,"result":"No Entrys available."} /
 // "... not found." at HTTP 200 or 404. An HTML 404 from a proxy or a wrong
-// endpoint, or "... not found." at another status (e.g. 422 "Template not
-// found."), is not — a Read must not drop state because of it.
+// endpoint, a 404 ENDPOINT_NOT_FOUND (no such route — wrong endpoint), or
+// "... not found." at another status (e.g. 422 "Template not found."), is
+// not — a Read must not drop state because of it.
 func IsNotFound(err error) bool {
 	apiErr, ok := AsAPIError(err)
-	if !ok || !apiErr.Enveloped {
+	if !ok || !apiErr.Enveloped || apiErr.Code == CodeEndpointNotFound {
 		return false
 	}
 	if apiErr.Status == 404 {

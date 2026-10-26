@@ -12,12 +12,11 @@ import (
 )
 
 // Rootserver endpoints the vServer resource uses, each answering exactly like
-// the real one (app/Http/Controllers/Api/RootserverController.php and
-// RootserverRenewalController.php) — including the older shapes:
+// the real one — including the older shapes:
 //
 //   - GET  /rootserver/{id}              envelope; unknown id → HTTP 200 {"success":false,"result":"No Entrys available."}
 //   - GET  /rootserver/{id}/rental       bare object {created_rental, delete_rental}; unknown → 404 {"success":false,"result":"Server not found."}
-//   - GET  /rootserver/{id}/addresses    bare array [{id,address,gateway,netmask}]; unknown → abort(404) = NOT_FOUND envelope
+//   - GET  /rootserver/{id}/addresses    bare array [{id,address,gateway,netmask}]; unknown → 404 NOT_FOUND envelope
 //   - GET  /rootserver/{id}/renew        envelope {balance, expires_at, auto_renew, options}; unknown → NOT_FOUND
 //   - PUT  /rootserver/{id}/display-name {"display_name"} 4–32 chars; 422 VALIDATION_ERROR; unknown → NOT_FOUND
 //   - PUT  /rootserver/{id}/autorenew    {"enabled"} boolean; 422 VALIDATION_ERROR; unknown → NOT_FOUND
@@ -37,11 +36,11 @@ func init() {
 	})
 }
 
-// renewIntervals is RenewalService::INTERVALS.
+// renewIntervals are the renewal periods in days the API offers.
 var renewIntervals = []int{10, 30, 90, 180, 365}
 
-// laravelTime formats like Eloquent's JSON date serialisation.
-const laravelTime = "2006-01-02T15:04:05.000000Z"
+// apiTime is the API's timestamp format (microseconds, UTC).
+const apiTime = "2006-01-02T15:04:05.000000Z"
 
 func abort404() Response {
 	return Fail(http.StatusNotFound, "NOT_FOUND", "Endpoint nicht gefunden.", nil)
@@ -104,13 +103,13 @@ func handleShowRootserver(st *State, r *Request) Response {
 	})
 }
 
-func laravelDate(v any) any {
+func apiDate(v any) any {
 	s, _ := v.(string)
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
 		return nil
 	}
-	return t.UTC().Format(laravelTime)
+	return t.UTC().Format(apiTime)
 }
 
 func handleRootserverRental(st *State, r *Request) Response {
@@ -119,8 +118,8 @@ func handleRootserverRental(st *State, r *Request) Response {
 		return Legacy(http.StatusNotFound, "Server not found.")
 	}
 	return Raw(http.StatusOK, map[string]any{
-		"created_rental": laravelDate(attrs["created_at"]),
-		"delete_rental":  laravelDate(attrs["expires_at"]),
+		"created_rental": apiDate(attrs["created_at"]),
+		"delete_rental":  apiDate(attrs["expires_at"]),
 	})
 }
 
@@ -182,8 +181,8 @@ func handleRootserverDisplayName(st *State, r *Request) Response {
 	return OK(map[string]any{"display_name": name})
 }
 
-// laravelBoolean is Laravel's "boolean" rule: true, false, 1, 0, "1", "0".
-func laravelBoolean(v any) (bool, bool) {
+// apiBoolean is what the API accepts as a boolean: true, false, 1, 0, "1", "0".
+func apiBoolean(v any) (bool, bool) {
 	switch x := v.(type) {
 	case bool:
 		return x, true
@@ -208,7 +207,7 @@ func handleRootserverAutoRenew(st *State, r *Request) Response {
 	if !present || v == nil {
 		return validationError("enabled", "The enabled field is required.")
 	}
-	enabled, ok := laravelBoolean(v)
+	enabled, ok := apiBoolean(v)
 	if !ok {
 		return validationError("enabled", "The enabled field must be true or false.")
 	}
@@ -231,8 +230,8 @@ func (st *State) packet(id int64) (map[string]any, bool) {
 	return nil, false
 }
 
-// fulfillRootserver completes a rootserver created by an order the way
-// RootserverFulfiller does: packet specs for a packet, packet_id 0 for a
+// fulfillRootserver completes a rootserver created by an order the way the
+// API does: packet specs for a packet, packet_id 0 for a
 // custom server, display_name = hostname, not yet installed, and the IPs.
 func (st *State) fulfillRootserver(itemType string, attrs map[string]any) {
 	packetID := int64(0)
@@ -303,9 +302,9 @@ func (s *Server) SetInstallAfterReads(id int64, n int) {
 	})
 }
 
-// validateServerItem checks what the configurators check beyond the
-// FormRequest, as far as the mock models it: the duration values and, for a
-// packet, that the packet exists (OrderingException::invalid → "field").
+// validateServerItem checks what the API checks beyond the request
+// validation, as far as the mock models it: the duration values and, for a
+// packet, that the packet exists (rejected with one "field").
 func (st *State) validateServerItem(index int, itemType string, it map[string]any) *Response {
 	invalid := func(key, message string) *Response {
 		resp := invalidField(fmt.Sprintf("items.%d.%s", index, key), message)

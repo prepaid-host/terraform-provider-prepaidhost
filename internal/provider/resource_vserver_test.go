@@ -174,7 +174,7 @@ func TestAccVserver_CreateCustom(t *testing.T) {
 				want := []string{"addresses", "backups", "client_reference", "cores", "disk", "duration_days", "hostname",
 					"memory", "password", "ssh_key_ids", "template_id", "traffic", "type"}
 				if got := keysOf(it); fmt.Sprint(got) != fmt.Sprint(want) {
-					return fmt.Errorf("item fields = %v, want %v (exactly the API's INPUT_KEYS for rootserver)", got, want)
+					return fmt.Errorf("item fields = %v, want %v (exactly the item fields the API evaluates for a rootserver)", got, want)
 				}
 				if it["type"] != "rootserver" || it["client_reference"] != "web1" || it["hostname"] != "web1" ||
 					it["password"] != "Sup3r-Secret!" || fmt.Sprint(it["ssh_key_ids"]) != "[3 5]" {
@@ -886,6 +886,23 @@ func TestVserver_ReadExpiredWithAutoRenewOff(t *testing.T) {
 	if resp.Diagnostics.HasError() || len(w) != 1 || !strings.Contains(w[0].Detail(), "expired on") ||
 		!strings.Contains(w[0].Detail(), "Auto-renew is off") || strings.Contains(w[0].Detail(), "may still renew") {
 		t.Errorf("want an expiry warning without the late-renewal hint, got %v", resp.Diagnostics)
+	}
+}
+
+// A route the API does not have (wrong endpoint, older API) answers 404
+// ENDPOINT_NOT_FOUND. That says nothing about the server: Read fails and the
+// state is kept, while a real NOT_FOUND removes it.
+func TestVserver_ReadEndpointNotFoundKeepsState(t *testing.T) {
+	api := vserverAPI(t)
+	id := api.SeedRootserver(nil)
+	api.InjectResponse(http.MethodGet, "/rootserver/{id}", 1,
+		testapi.Fail(http.StatusNotFound, client.CodeEndpointNotFound, "Endpoint nicht gefunden.", nil))
+	resp := readDirect(t, api, id, nil)
+	if !resp.Diagnostics.HasError() || !strings.Contains(errorText(resp.Diagnostics), client.CodeEndpointNotFound) {
+		t.Fatalf("want an error naming ENDPOINT_NOT_FOUND, got %v", resp.Diagnostics)
+	}
+	if resp.State.Raw.IsNull() {
+		t.Errorf("a missing route must not remove the server from the state")
 	}
 }
 

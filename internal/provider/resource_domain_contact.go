@@ -76,7 +76,7 @@ type domainContactModel struct {
 }
 
 // domainContactAPI is one entry of GET /account/domain-contacts
-// (DomainContactController::present — no fax, no identification).
+// (the API presents no fax and no identification).
 type domainContactAPI struct {
 	ID           int64   `json:"id"`
 	HandleCode   *string `json:"handle_code"`

@@ -14,10 +14,10 @@ import (
 // ResourceDomainContact is the State.Resources type of domain contacts.
 const ResourceDomainContact = "domain_contact"
 
-// MaxDomainContacts is DomainContactService::MAX_CONTACTS.
+// MaxDomainContacts is how many domain contacts the API allows per account.
 const MaxDomainContacts = 10
 
-// Mirrors DomainContactController: GET and POST /account/domain-contacts.
+// GET and POST /account/domain-contacts like the API.
 // The API has no read-by-id and no delete endpoint for contacts.
 func init() {
 	register(func(s *Server) {
@@ -26,8 +26,8 @@ func init() {
 	})
 }
 
-// domainContactIdentification are the registrar fields of
-// config/domain_requirements.php: accepted on create, never echoed back.
+// domainContactIdentification are the registrar identification fields:
+// accepted on create, never echoed back.
 var domainContactIdentification = map[string]string{
 	"idcard": "string", "idcardissuedate": "date", "idcardauthority": "string",
 	"taxnr": "string", "vatnr": "string", "dateofbirth": "date",
@@ -40,7 +40,7 @@ var (
 	emailRE = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 )
 
-// presentDomainContact is DomainContactController::present().
+// presentDomainContact presents a contact like the API.
 func presentDomainContact(attrs map[string]any) map[string]any {
 	out := map[string]any{}
 	for _, k := range []string{
@@ -124,7 +124,7 @@ func handleCreateDomainContact(st *State, r *Request) Response {
 		return Fail(http.StatusUnprocessableEntity, "VALIDATION_FAILED", "Validation failed.", map[string]any{"fields": bag})
 	}
 
-	// DomainContactService::create
+	// Create, with the per-account limit.
 	ids := st.ResourceIDs(ResourceDomainContact)
 	if len(ids) >= MaxDomainContacts {
 		return Fail(http.StatusTooManyRequests, "MAX_CONTACTS", "The maximum number of contacts is reached.", nil)

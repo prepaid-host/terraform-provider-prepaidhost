@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,8 +25,15 @@ const (
 	defaultRetryBackoff = time.Second
 	defaultPollInterval = 10 * time.Second
 	maxBackoff          = 30 * time.Second
-	maxErrorBodyLength  = 512
-	maxRedirects        = 10
+	// defaultMaxThrottleRetries is how often a request refused with HTTP 429
+	// is repeated. It is counted apart from the 5xx/network retries: a
+	// refresh of many resources can run into the per-minute limit of the API
+	// several times, and every wait is bounded by Retry-After and the context.
+	defaultMaxThrottleRetries = 10
+	// defaultMaxRetryAfter caps a single Retry-After wait.
+	defaultMaxRetryAfter = 90 * time.Second
+	maxErrorBodyLength   = 512
+	maxRedirects         = 10
 )
 
 // Client talks to the Prepaid-Host API with a Bearer token.
@@ -37,6 +45,9 @@ type Client struct {
 	maxRetries   int
 	retryBackoff time.Duration
 	pollInterval time.Duration
+
+	maxThrottleRetries int
+	maxRetryAfter      time.Duration
 }
 
 // Option configures a Client.
@@ -79,6 +90,27 @@ func WithRetryBackoff(d time.Duration) Option {
 	}
 }
 
+// WithMaxThrottleRetries sets how often a request refused with HTTP 429 Too
+// Many Requests is repeated (default 10). Only requests that are safe to
+// repeat are retried, see Do.
+func WithMaxThrottleRetries(n int) Option {
+	return func(c *Client) {
+		if n >= 0 {
+			c.maxThrottleRetries = n
+		}
+	}
+}
+
+// WithMaxRetryAfter caps the wait a Retry-After header of a 429 answer can
+// ask for (default 90s).
+func WithMaxRetryAfter(d time.Duration) Option {
+	return func(c *Client) {
+		if d > 0 {
+			c.maxRetryAfter = d
+		}
+	}
+}
+
 // WithPollInterval sets the interval returned by PollInterval (default 10s),
 // used when waiting for an order to be provisioned.
 func WithPollInterval(d time.Duration) Option {
@@ -99,6 +131,9 @@ func New(endpoint, token string, opts ...Option) *Client {
 		maxRetries:   defaultMaxRetries,
 		retryBackoff: defaultRetryBackoff,
 		pollInterval: defaultPollInterval,
+
+		maxThrottleRetries: defaultMaxThrottleRetries,
+		maxRetryAfter:      defaultMaxRetryAfter,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -136,6 +171,13 @@ func (c *Client) PollInterval() time.Duration { return c.pollInterval }
 // exponential backoff) happen only for GET and for POST /orders carrying an
 // Idempotency-Key header — never for other writes, which could otherwise run
 // twice.
+//
+// HTTP 429 Too Many Requests (the API's rate limit) is retried for GET, for
+// POST /orders/quote (prices only, changes nothing) and for POST /orders with
+// an Idempotency-Key, up to WithMaxThrottleRetries times. Each wait follows
+// the Retry-After header (capped by WithMaxRetryAfter; exponential backoff
+// without it) and never outlasts the context: when the context ends before
+// the wait would, the 429 is returned at once. Other writes are not retried.
 func (c *Client) Do(ctx context.Context, method, path string, body any, out any, headers map[string]string) error {
 	_, err := c.do(ctx, method, path, body, out, headers)
 	return err
@@ -149,6 +191,36 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, out any,
 func (c *Client) DoRaw(ctx context.Context, method, path string, body any, out any) error {
 	_, err := c.send(ctx, method, path, body, out, nil, decodeRaw)
 	return err
+}
+
+// ErrNotTheAPI is returned by CheckEndpoint when the endpoint does not answer
+// like the Prepaid-Host API.
+var ErrNotTheAPI = errors.New("the endpoint does not answer like the Prepaid-Host API")
+
+// CheckEndpoint sends GET /catalog once, without retries, and returns an error
+// wrapping ErrNotTheAPI when the answer shows that the endpoint is not the
+// API: HTTP 404 (no such route, or an HTML error page) or a success answer
+// without the API envelope (a web page). Every other outcome — success, a
+// rejected token, the rate limit, a server or network error — returns nil:
+// the endpoint may be right, and the real calls report such failures
+// themselves.
+func (c *Client) CheckEndpoint(ctx context.Context) error {
+	_, err := c.once(ctx, http.MethodGet, c.endpoint+"/catalog", nil, nil, nil, decode)
+	if err == nil {
+		return nil
+	}
+	if apiErr, ok := AsAPIError(err); ok {
+		if apiErr.Status == http.StatusNotFound {
+			return fmt.Errorf("%w: GET %s/catalog answered %v", ErrNotTheAPI, c.endpoint, err)
+		}
+		return nil
+	}
+	var te *transportError
+	if errors.As(err, &te) {
+		return nil
+	}
+	// A success status whose body is not the envelope (see decode).
+	return fmt.Errorf("%w: GET %s/catalog answered %v", ErrNotTheAPI, c.endpoint, err)
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any, headers map[string]string) (http.Header, error) {
@@ -168,24 +240,43 @@ func (c *Client) send(ctx context.Context, method, path string, body any, out an
 	}
 
 	url := c.endpoint + "/" + strings.TrimLeft(path, "/")
-	retryable := isRetryable(method, path, headers)
+	retryTransient, retryThrottled := retryPolicy(method, path, headers)
 
-	var lastErr error
-	for attempt := 0; ; attempt++ {
-		if attempt > 0 {
-			if err := sleep(ctx, c.backoff(attempt)); err != nil {
-				return nil, errors.Join(lastErr, err)
-			}
-		}
-
+	attempt, throttled := 0, 0
+	for {
 		header, err := c.once(ctx, method, url, payload, out, headers, dec)
 		if err == nil {
 			return header, nil
 		}
-		lastErr = err
-
-		if !retryable || attempt >= c.maxRetries || !isTransient(err) || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return header, err
+		}
+
+		var wait time.Duration
+		switch {
+		case IsThrottled(err):
+			if !retryThrottled || throttled >= c.maxThrottleRetries {
+				return header, err
+			}
+			throttled++
+			wait = retryAfter(header, time.Now())
+			if wait <= 0 {
+				wait = c.backoff(throttled)
+			}
+			wait = min(wait, c.maxRetryAfter)
+			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < wait {
+				// Waiting would only end in the context's error.
+				return header, err
+			}
+		case retryTransient && attempt < c.maxRetries && isTransient(err):
+			attempt++
+			wait = c.backoff(attempt)
+		default:
+			return header, err
+		}
+
+		if serr := sleep(ctx, wait); serr != nil {
+			return nil, errors.Join(err, serr)
 		}
 	}
 }
@@ -324,21 +415,55 @@ func isTransient(err error) bool {
 	return ok && apiErr.Status >= 500
 }
 
-// isRetryable implements the retry rule: GET always, POST /orders only with an
-// Idempotency-Key (the server then replays instead of charging twice).
-func isRetryable(method, path string, headers map[string]string) bool {
+// retryPolicy implements the retry rules of Do. transient: network errors
+// and HTTP 5xx — GET always, POST /orders only with an Idempotency-Key (the
+// server then replays instead of charging twice). throttled: HTTP 429 — the
+// same plus POST /orders/quote, which only prices.
+func retryPolicy(method, path string, headers map[string]string) (transient, throttled bool) {
 	switch method {
 	case http.MethodGet:
-		return true
+		return true, true
 	case http.MethodPost:
 		p := path
 		if i := strings.IndexAny(p, "?#"); i >= 0 {
 			p = p[:i]
 		}
 		p = "/" + strings.Trim(p, "/")
-		return p == "/orders" && headerValue(headers, "Idempotency-Key") != ""
+		switch {
+		case p == "/orders" && headerValue(headers, "Idempotency-Key") != "":
+			return true, true
+		case p == "/orders/quote":
+			return false, true
+		}
 	}
-	return false
+	return false, false
+}
+
+// IsThrottled reports whether err is an HTTP 429 Too Many Requests answer
+// (the API's rate limit). Do returns one once the retries for it ran out, or
+// for a write that is never retried.
+func IsThrottled(err error) bool {
+	apiErr, ok := AsAPIError(err)
+	return ok && apiErr.Status == http.StatusTooManyRequests
+}
+
+// retryAfter reads the Retry-After header: delay seconds or an HTTP date.
+// It returns 0 when the header is missing or unreadable.
+func retryAfter(header http.Header, now time.Time) time.Duration {
+	v := strings.TrimSpace(header.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return max(t.Sub(now), 0)
+	}
+	return 0
 }
 
 func headerValue(headers map[string]string, name string) string {

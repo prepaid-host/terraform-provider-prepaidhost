@@ -8,11 +8,11 @@ import (
 	"slices"
 )
 
-// catalogTypes are the types GET /catalog lists (CatalogController::TYPES).
+// catalogTypes are the types GET /catalog lists.
 var catalogTypes = []string{"rootserver", "rootpacket", "domain"}
 
-// Mirrors CatalogController: GET /catalog and GET /catalog/{type}. The shape of
-// each type's result follows the configurators' catalog() methods.
+// GET /catalog and GET /catalog/{type} like the API. The shape of each type's
+// result follows the API's catalog of that type.
 func init() {
 	register(func(s *Server) {
 		s.Handle(http.MethodGet, "/catalog", handleCatalogTypes)
@@ -53,7 +53,7 @@ func templates() []any {
 }
 
 // defaultCatalog is a small but complete catalog in the exact shape of the
-// configurators (option values are strings, like ProductOptionEntry::value).
+// API's catalog (option values are strings, as the API sends them).
 func defaultCatalog(typ string) map[string]any {
 	switch typ {
 	case "rootserver":

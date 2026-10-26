@@ -15,23 +15,22 @@ import (
 )
 
 // Domain endpoints the domain and DNS record resources use, each answering
-// like the real one (app/Http/Controllers/Api/DomainController.php,
-// DomainManagementController.php, DnsRecordService):
+// like the real one:
 //
 //   - GET    /domain/{id}                    envelope {id, authcode, sld, tld, owner}; unknown → HTTP 200 {"success":false,"result":"Domain not found."}
-//   - GET    /domain/{id}/nameservers        {nameservers, source}; unknown → abort(404) = NOT_FOUND
+//   - GET    /domain/{id}/nameservers        {nameservers, source}; unknown → 404 NOT_FOUND
 //   - PUT    /domain/{id}/nameservers        {"nameservers": [2–4] | null}; 422 VALIDATION_ERROR; result {nameservers}
 //   - GET    /domain/{id}/renew              {price, years, balance, affordable, renewable, expires_at, auto_renew}; unknown or no rental → NOT_FOUND
 //   - PUT    /domain/{id}/autorenew          {"enabled"} boolean; unknown or no rental → NOT_FOUND
-//   - GET    /domain/{id}/dns                the zone (incl. the apex NS records); unknown domain → findOrFail = NOT_FOUND
-//   - POST   /domain/{id}/dns                StoreDnsRecordRequest → 201 record
-//   - PUT    /domain/{id}/dns/{recordId}     UpdateDnsRecordRequest → record; unknown record, NS or type change → 422 DNS_RECORD_REJECTED
+//   - GET    /domain/{id}/dns                the zone (incl. the apex NS records); unknown domain → 404 NOT_FOUND
+//   - POST   /domain/{id}/dns                validated record → 201 record
+//   - PUT    /domain/{id}/dns/{recordId}     validated record → record; unknown record, NS or type change → 422 DNS_RECORD_REJECTED
 //   - DELETE /domain/{id}/dns/{recordId}     → "deleted"; unknown record or NS → 422 DNS_RECORD_REJECTED
 //
 // Domain attributes in State.Resources["domain"]: sld, tld, name, authcode,
 // owner, auto_renew (bool), created_at / expires_at (RFC 3339), nameservers
-// ([]string), dns_records ([]map[string]any, host "" = zone root, like
-// ClouDNS), no_rental (mock only: the domain has no rental row) and
+// ([]string), dns_records ([]map[string]any, host "" = zone root, as the
+// DNS backend stores it), no_rental (mock only: the domain has no rental row) and
 // nameserver_source (mock only: "local" = the registrar did not answer).
 func init() {
 	register(func(s *Server) {
@@ -47,13 +46,13 @@ func init() {
 	})
 }
 
-// DefaultNameservers is NameserverService::DEFAULTS.
+// DefaultNameservers are the platform's nameservers a new domain gets.
 var DefaultNameservers = []string{"ns1.prepaid-host.com", "ns2.prepaid-host.com", "ns3.prepaid-host.com", "ns4.prepaid-host.com"}
 
-// domainDurations is DomainConfigurator::DURATIONS.
+// domainDurations are the domain terms in months the API accepts.
 var domainDurations = []int64{12, 24, 36}
 
-// DNSTypes is DnsRecordService::SUPPORTED_TYPES, DNSTTLs its ALLOWED_TTLS.
+// DNSTypes are the record types the API supports, DNSTTLs the TTLs it allows.
 var (
 	DNSTypes = []string{"A", "AAAA", "CNAME", "MX", "TXT", "SRV"}
 	DNSTTLs  = []int64{60, 300, 600, 900, 1800, 3600, 21600, 43200, 86400, 172800, 259200, 604800, 1209600, 2592000}
@@ -82,10 +81,10 @@ func hasRental(attrs map[string]any) bool {
 	return !b
 }
 
-// ---- ordering (DomainConfigurator in API mode) ----
+// ---- ordering ----
 
-// validateDomainItem checks a domain item like DomainConfigurator::configure
-// in API mode: the rules in their order (the first failing one is reported),
+// validateDomainItem checks a domain item like the API does for an order:
+// the rules in their order (the first failing one is reported),
 // then the TLD, then the availability of a register.
 func (st *State) validateDomainItem(index int, it map[string]any) *Response {
 	invalid := func(key, message string) *Response {
@@ -173,8 +172,8 @@ func (st *State) knownTLD(tld string) bool {
 	return false
 }
 
-// fulfillDomain completes a domain created by an order like DomainFulfiller
-// plus the registration job: owner from the contact, the platform's
+// fulfillDomain completes a domain created by an order like the API's
+// fulfilment and registration: owner from the contact, the platform's
 // nameservers and a zone with the four apex NS records.
 func (st *State) fulfillDomain(attrs map[string]any) {
 	if c, ok := st.Resource(ResourceDomainContact, toInt(attrs["contact_id"])); ok {
@@ -294,7 +293,7 @@ func handleDomainAutoRenew(st *State, r *Request) Response {
 	if !present || v == nil {
 		return validationError("enabled", "The enabled field is required.")
 	}
-	enabled, ok := laravelBoolean(v)
+	enabled, ok := apiBoolean(v)
 	if !ok {
 		return validationError("enabled", "The enabled field must be true or false.")
 	}
@@ -310,7 +309,7 @@ func handleDomainNameservers(st *State, r *Request) Response {
 		return abort404()
 	}
 	ns, _ := attrs["nameservers"].([]string)
-	// NameserverService::get falls back to the local ns1/ns2 columns when the
+	// The API falls back to its local copy of ns1/ns2 when the
 	// registrar has no answer (mock: nameserver_source = "local").
 	if attrs["nameserver_source"] == "local" {
 		return OK(map[string]any{"nameservers": append([]string{}, ns[:min(2, len(ns))]...), "source": "local"})
@@ -318,8 +317,8 @@ func handleDomainNameservers(st *State, r *Request) Response {
 	return OK(map[string]any{"nameservers": append([]string{}, ns...), "source": "registrar"})
 }
 
-// normaliseNameservers is UpdateNameserversRequest::normaliseNameservers
-// (without the IDN conversion): whitespace, scheme, path and port removed,
+// normaliseNameservers normalises like the API before validating (without
+// the IDN conversion): whitespace, scheme, path and port removed,
 // lower-cased, trailing dot dropped, empty entries and duplicates removed.
 func normaliseNameservers(raw []any) []string {
 	out := []string{}
@@ -382,7 +381,7 @@ func zone(d map[string]any) []map[string]any {
 	return z
 }
 
-// presentDNS is DnsRecordService::normalise: root host as "@", priority null
+// presentDNS presents a record like the API: root host as "@", priority null
 // unless set, weight and port only for SRV.
 func presentDNS(rec map[string]any) map[string]any {
 	host, _ := rec["host"].(string)
@@ -414,8 +413,8 @@ func handleListDNS(st *State, r *Request) Response {
 	return OK(out)
 }
 
-// dnsFieldErrors validates the DNS fields that are present like the
-// FormRequests (Laravel's integer rule: integral numbers or numeric strings).
+// dnsFieldErrors validates the DNS fields that are present like the API
+// (integer fields: integral numbers or numeric strings).
 func dnsFieldErrors(body map[string]any, creating bool) map[string]any {
 	errs := map[string]any{}
 	fail := func(field, msg string) { errs[field] = []string{msg} }
@@ -425,7 +424,7 @@ func dnsFieldErrors(body map[string]any, creating bool) map[string]any {
 		if !ok || v == nil {
 			return false
 		}
-		n, isInt := laravelInt(v)
+		n, isInt := apiInt(v)
 		if !isInt {
 			fail(field, "The "+field+" field must be an integer.")
 		} else if n < lo || n > hi {
@@ -450,7 +449,7 @@ func dnsFieldErrors(body map[string]any, creating bool) map[string]any {
 		}
 	}
 	if v, present := body["ttl"]; present && (v != nil || !creating) {
-		if n, isInt := laravelInt(v); !isInt || !slices.Contains(DNSTTLs, n) {
+		if n, isInt := apiInt(v); !isInt || !slices.Contains(DNSTTLs, n) {
 			fail("ttl", "Diese TTL wird nicht unterstützt.")
 		}
 	}
@@ -468,7 +467,7 @@ func dnsFieldErrors(body map[string]any, creating bool) map[string]any {
 	return errs
 }
 
-func laravelInt(v any) (int64, bool) {
+func apiInt(v any) (int64, bool) {
 	switch x := v.(type) {
 	case float64:
 		if x == math.Trunc(x) {
@@ -487,7 +486,7 @@ func dnsValidationError(errs map[string]any) Response {
 	return Fail(http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Validierungsfehler.", map[string]any{"details": errs})
 }
 
-// resolvePriority is DnsRecordService::resolvePriority.
+// resolvePriority sets a record's priority like the API (MX and SRV only).
 func resolvePriority(typ string, v any) any {
 	if typ != "MX" && typ != "SRV" {
 		return nil
@@ -498,7 +497,7 @@ func resolvePriority(typ string, v any) any {
 		}
 		return int64(0)
 	}
-	n, _ := laravelInt(v)
+	n, _ := apiInt(v)
 	return n
 }
 
@@ -537,15 +536,15 @@ func handleCreateDNS(st *State, r *Request) Response {
 	typ := body["type"].(string) //nolint:forcetypeassert // validated
 	ttl := int64(300)
 	if v, ok := body["ttl"]; ok && v != nil {
-		ttl, _ = laravelInt(v)
+		ttl, _ = apiInt(v)
 	}
 	rec := map[string]any{
 		"id": st.NextID(), "type": typ, "host": rootHost(body["host"]), "record": body["record"], "ttl": ttl,
 		"priority": resolvePriority(typ, body["priority"]),
 	}
 	if typ == "SRV" {
-		w, _ := laravelInt(body["weight"])
-		p, _ := laravelInt(body["port"])
+		w, _ := apiInt(body["weight"])
+		p, _ := apiInt(body["port"])
 		rec["weight"], rec["port"] = w, p
 	}
 	d["dns_records"] = append(zone(d), rec)
@@ -615,7 +614,7 @@ func handleUpdateDNS(st *State, r *Request) Response {
 		rec["record"] = v
 	}
 	if v, ok := body["ttl"]; ok && v != nil {
-		rec["ttl"], _ = laravelInt(v)
+		rec["ttl"], _ = apiInt(v)
 	}
 	if v, ok := body["priority"]; ok {
 		rec["priority"] = resolvePriority(typ, v)
@@ -623,7 +622,7 @@ func handleUpdateDNS(st *State, r *Request) Response {
 	if typ == "SRV" {
 		for _, f := range []string{"weight", "port"} {
 			if v, ok := body[f]; ok && v != nil {
-				rec[f], _ = laravelInt(v)
+				rec[f], _ = apiInt(v)
 			}
 		}
 	}

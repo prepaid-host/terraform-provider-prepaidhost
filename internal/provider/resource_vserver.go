@@ -58,7 +58,7 @@ const (
 	// minPostPurchase is the time the reads after a paid order get at least,
 	// even when create_timeout is (nearly) used up.
 	minPostPurchase = 30 * time.Second
-	// Display names the panel accepts (RootserverController::updateDisplayName).
+	// Display name lengths the API accepts.
 	minDisplayName = 4
 	maxDisplayName = 32
 )
@@ -139,8 +139,8 @@ func (f *flexBool) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// vserverShowAPI is GET /rootserver/{id} (RootserverController::show selects
-// exactly these columns; no hostname, IPs or expiry).
+// vserverShowAPI is GET /rootserver/{id} (it answers exactly these fields;
+// no hostname, IPs or expiry).
 type vserverShowAPI struct {
 	ID           flexInt  `json:"id"`
 	Cores        flexInt  `json:"cores"`
@@ -413,7 +413,7 @@ func (m *vserverModel) sshKeyIDs(ctx context.Context) ([]int64, diag.Diagnostics
 	return ids, diags
 }
 
-// orderItem is the order item: exactly the API's INPUT_KEYS of the item type
+// orderItem is the order item: exactly the fields the API evaluates for the item type
 // (rootpacket when packet_id is set, else rootserver), unset ones left out.
 // The engine adds client_reference (= hostname).
 func (m *vserverModel) orderItem(ctx context.Context, password types.String) (map[string]any, diag.Diagnostics) {

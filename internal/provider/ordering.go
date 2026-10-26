@@ -55,8 +55,8 @@ const (
 	replayTolerance = 2 * time.Minute
 )
 
-// rootserverMonths maps a rootserver's duration_days to the months of its
-// rental, like RootserverFulfiller.
+// rootserverMonths maps a rootserver's duration_days to the months the API
+// rents it for.
 var rootserverMonths = map[int]int{30: 1, 90: 3, 180: 6, 365: 12}
 
 // orderResourceTypes maps an order item type to the resource type the API
@@ -69,12 +69,11 @@ var orderResourceTypes = map[string]string{
 
 // purchaseFields are the item fields that decide what is bought and what it
 // costs — the material of the Idempotency-Key. It is an allowlist of fields
-// the API actually evaluates (OrderPlacementService::INPUT_KEYS), on purpose:
+// the API actually evaluates for an order item (it ignores all others), on purpose:
 //
 //   - Secrets stay out (password, authcode): the key is a plain SHA-256 sent to
 //     the API in a header, and a hash of a password plus guessable fields could
-//     be brute-forced. (The API itself keys its request fingerprint with an
-//     HMAC for exactly this reason.)
+//     be brute-forced.
 //   - Fields that change neither product nor price stay out (ssh_key_ids,
 //     hostname, contact_id): changing them must not turn a repeated apply into
 //     a new purchase.
@@ -289,6 +288,15 @@ func addPlaceOrderError(ctx context.Context, diags *diag.Diagnostics, err error,
 			fmt.Sprintf("An earlier request for this order (same Idempotency-Key) was still being processed by the API after %s. "+
 				"Run apply again — it will not be bought twice: the next apply uses the same key and gets this order.\n\n%s",
 				timeout, describeError(err)))
+	case client.IsThrottled(err):
+		// Refused by the rate limit, even after waiting it out. This request
+		// placed nothing, but an earlier attempt with the same key (whose
+		// answer was lost) may have.
+		diags.AddError("Order outcome unknown",
+			fmt.Sprintf("The API's rate limit refused the order request, also after waiting as long as it asked; an earlier attempt "+
+				"with the same Idempotency-Key may or may not have been placed. "+
+				"Run apply again — it will not be bought twice: the next apply uses the same Idempotency-Key and gets the order if it was placed.\n\n%s",
+				describeError(err)))
 	case ctx.Err() != nil || isTransportError(err):
 		diags.AddError("Order outcome unknown",
 			fmt.Sprintf("The order request did not complete (timeout %s); it may or may not have been placed. "+
@@ -310,9 +318,10 @@ func addPlaceOrderError(ctx context.Context, diags *diag.Diagnostics, err error,
 // termOver reports whether the term of a replayed order has ended:
 // created_at + the item's duration in calendar months lies before now. The
 // months are what the API rents: rootpacket and domain duration_months
-// (default 1); rootserver duration_days mapped like RootserverFulfiller
-// (30→1, 90→3, 180→6, 365→12, otherwise days/30 rounded, at least 1; default
-// 1), added like Carbon::addMonths. An unreadable created_at counts as "not
+// (default 1); rootserver duration_days mapped to months (30→1, 90→3,
+// 180→6, 365→12, otherwise days/30 rounded, at least 1; default 1), added as
+// calendar months that overflow into the next month like the API's date
+// arithmetic (Jan 31 + 1 month = Mar 3). An unreadable created_at counts as "not
 // over": the engine then never buys again.
 func termOver(order *client.Order, item map[string]any, now time.Time) bool {
 	created, err := time.Parse(time.RFC3339, order.CreatedAt)
@@ -652,33 +661,36 @@ const (
 // itemStatus returns the status of the order item that created the resource
 // (GET /orders: items carry resource_id and client_reference). found is false
 // when no order of this account names the resource — one ordered in the panel
-// — or the lookup failed; the caller then has nothing to say about it.
-func itemStatus(ctx context.Context, c *client.Client, resourceType string, resourceID int64) (status string, found bool) {
+// — and the caller then has nothing to say about it. err is set when the
+// order list could not be read: then nothing is known either way.
+func itemStatus(ctx context.Context, c *client.Client, resourceType string, resourceID int64) (status string, found bool, err error) {
 	for page := 1; page <= orderListPages; page++ {
 		orders, err := c.ListOrders(ctx, page, orderListPerPage)
-		if err != nil || len(orders) == 0 {
-			return "", false
+		if err != nil {
+			return "", false, err
 		}
 		for _, o := range orders {
 			for _, it := range o.Items {
 				if it.ResourceType == resourceType && it.ResourceID == resourceID {
-					return it.Status, true
+					return it.Status, true, nil
 				}
 			}
 		}
 		if len(orders) < orderListPerPage {
-			return "", false
+			return "", false, nil
 		}
 	}
-	return "", false
+	return "", false, nil
 }
 
 // pendingItemStatus is itemStatus for a resource that must be active: it
 // returns the item's status when that is not active yet (provisioning,
-// failed), and "" when the resource is active or unknown to the orders.
-func pendingItemStatus(ctx context.Context, c *client.Client, resourceType string, resourceID int64) string {
-	if status, found := itemStatus(ctx, c, resourceType, resourceID); found && status != client.StatusActive {
-		return status
+// failed), and "" when the resource is active or unknown to the orders. On
+// err the status is unknown; the caller keeps what it knew.
+func pendingItemStatus(ctx context.Context, c *client.Client, resourceType string, resourceID int64) (string, error) {
+	status, found, err := itemStatus(ctx, c, resourceType, resourceID)
+	if err != nil || !found || status == client.StatusActive {
+		return "", err
 	}
-	return ""
+	return status, nil
 }
