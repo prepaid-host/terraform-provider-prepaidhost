@@ -1,0 +1,122 @@
+// Copyright (c) Prepaid-Host
+// SPDX-License-Identifier: MPL-2.0
+
+package client
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+)
+
+// Error codes the ordering endpoints return in error.code.
+const (
+	CodeValidationFailed      = "VALIDATION_FAILED"
+	CodeDomainUnavailable     = "DOMAIN_UNAVAILABLE"
+	CodeInsufficientBalance   = "INSUFFICIENT_BALANCE"
+	CodePriceChanged          = "PRICE_CHANGED"
+	CodeIdempotencyConflict   = "IDEMPOTENCY_CONFLICT"
+	CodeIdempotencyInProgress = "IDEMPOTENCY_IN_PROGRESS"
+	CodeClientReferenceInUse  = "CLIENT_REFERENCE_IN_USE"
+	CodePromoCodeUnavailable  = "PROMO_CODE_UNAVAILABLE"
+	CodeOrderFailed           = "ORDER_FAILED"
+	CodeOrderNotFound         = "ORDER_NOT_FOUND"
+	CodeInsufficientScope     = "INSUFFICIENT_SCOPE"
+	CodeDuplicateContact      = "DUPLICATE_CONTACT"
+	CodeUnauthenticated       = "UNAUTHENTICATED"
+)
+
+// APIError is a failed API call: either the error envelope
+// {"success":false,"error":{"code","message",...}} or, for older endpoints,
+// {"success":false,"result":"<message>"} (which may come with HTTP 200).
+//
+// Extra holds every field of the error object besides code and message,
+// e.g. missing_amount, expected/actual, resource_type/resource_id.
+type APIError struct {
+	Status  int
+	Code    string
+	Message string
+	Extra   map[string]any
+}
+
+// Error implements error.
+func (e *APIError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "prepaid-host API: HTTP %d", e.Status)
+	if e.Code != "" {
+		b.WriteString(" ")
+		b.WriteString(e.Code)
+	}
+	if e.Message != "" {
+		b.WriteString(": ")
+		b.WriteString(e.Message)
+	}
+	return b.String()
+}
+
+// Float returns a numeric field of Extra.
+func (e *APIError) Float(key string) (float64, bool) {
+	switch v := e.Extra[key].(type) {
+	case float64:
+		return v, true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	}
+	return 0, false
+}
+
+// Int64 returns an integral numeric field of Extra.
+func (e *APIError) Int64(key string) (int64, bool) {
+	f, ok := e.Float(key)
+	if !ok || f != math.Trunc(f) {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// String returns a string field of Extra.
+func (e *APIError) String(key string) (string, bool) {
+	s, ok := e.Extra[key].(string)
+	return s, ok
+}
+
+// AsAPIError unwraps err to an *APIError.
+func AsAPIError(err error) (*APIError, bool) {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr, true
+	}
+	return nil, false
+}
+
+// IsCode reports whether err is an APIError with the given code.
+func IsCode(err error, code string) bool {
+	apiErr, ok := AsAPIError(err)
+	return ok && apiErr.Code == code
+}
+
+// IsNotFound reports whether err means "this resource does not exist (any more)".
+// It covers HTTP 404, *_NOT_FOUND codes and the legacy endpoints that answer
+// with HTTP 200 and {"success":false,"result":"No Entrys available."} or
+// "... not found.".
+func IsNotFound(err error) bool {
+	apiErr, ok := AsAPIError(err)
+	if !ok {
+		return false
+	}
+	if apiErr.Status == 404 || strings.HasSuffix(apiErr.Code, "_NOT_FOUND") {
+		return true
+	}
+	if apiErr.Code != "" {
+		return false
+	}
+	msg := strings.ToLower(apiErr.Message)
+	return strings.Contains(msg, "no entrys available") || strings.Contains(msg, "not found")
+}
