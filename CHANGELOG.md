@@ -2,9 +2,9 @@
 
 All notable changes to this provider. Versions follow [Semantic Versioning](https://semver.org). The release process is in [RELEASING.md](RELEASING.md).
 
-## Unreleased
+## 0.1.0 (October 26, 2026)
 
-Nothing is published yet; the first release will contain:
+First release.
 
 FEATURES:
 
