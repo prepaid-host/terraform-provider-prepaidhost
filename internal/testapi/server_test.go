@@ -252,7 +252,7 @@ func TestPromoCode(t *testing.T) {
 	api.SetBalance(100)
 	api.SetPrice("domain", 10)
 	api.SetPromo("SAVE2", 2)
-	body := map[string]any{"items": []any{map[string]any{"type": "domain", "sld": "example", "tld": "de"}}, "promo_code": "SAVE2"}
+	body := map[string]any{"items": []any{domainOrderItem(api, "example")}, "promo_code": "SAVE2"}
 
 	_, env := call(t, api, http.MethodPost, "/orders/quote", api.Token, body, nil)
 	var q struct {
@@ -284,7 +284,7 @@ func TestPromoCode(t *testing.T) {
 func TestDomainUnavailable(t *testing.T) {
 	api := testapi.New(t)
 	api.SetDomainUnavailable("taken.de")
-	body := map[string]any{"items": []any{map[string]any{"type": "domain", "sld": "Taken", "tld": "de"}}}
+	body := map[string]any{"items": []any{domainOrderItem(api, "Taken")}}
 	resp, env := call(t, api, http.MethodPost, "/orders/quote", api.Token, body, nil)
 	if resp.StatusCode != http.StatusUnprocessableEntity || env.Error["code"] != "DOMAIN_UNAVAILABLE" || env.Error["domain"] != "taken.de" {
 		t.Errorf("status=%d env=%+v", resp.StatusCode, env)
@@ -314,7 +314,7 @@ func TestDomainRequiresSldAndTld(t *testing.T) {
 func TestDomainOrderStoresFullName(t *testing.T) {
 	api := testapi.New(t)
 	api.SetBalance(100)
-	it := map[string]any{"type": "domain", "sld": "example", "tld": "de", "client_reference": "example.de"}
+	it := domainOrderItem(api, "example")
 	resp, _ := call(t, api, http.MethodPost, "/orders", api.Token, map[string]any{"items": []any{it}, "expected_total": 12.0}, map[string]string{"Idempotency-Key": "key-domain01"})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status=%d", resp.StatusCode)

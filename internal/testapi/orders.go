@@ -109,22 +109,26 @@ func invalidField(field, message string) Response {
 	return Fail(http.StatusUnprocessableEntity, "VALIDATION_FAILED", message, map[string]any{"field": field})
 }
 
-// domainName is sld + "." + tld, lower-cased like DomainConfigurator.
+// domainName is sld + "." + tld like DomainConfigurator: only the sld is
+// lower-cased, the tld is taken as sent.
 func domainName(it map[string]any) string {
 	sld, _ := it["sld"].(string)
 	tld, _ := it["tld"].(string)
-	return strings.ToLower(sld) + "." + strings.ToLower(strings.TrimPrefix(tld, "."))
+	return strings.ToLower(sld) + "." + tld
 }
 
-// reference is the item's client_reference, or the hostname for servers.
+// reference is the item's client_reference (for a domain always its name, as
+// DomainConfigurator sets it in API mode), or the hostname for servers.
 func reference(it map[string]any) *string {
+	if it["type"] == "domain" {
+		name := domainName(it)
+		return &name
+	}
 	if ref, ok := it["client_reference"].(string); ok && ref != "" {
 		return &ref
 	}
-	if it["type"] != "domain" {
-		if host, ok := it["hostname"].(string); ok && host != "" {
-			return &host
-		}
+	if host, ok := it["hostname"].(string); ok && host != "" {
+		return &host
 	}
 	return nil
 }
@@ -145,18 +149,9 @@ func (st *State) price(body *orderBody) (*pricing, *Response) {
 	for i, it := range body.Items {
 		typ, _ := it["type"].(string)
 		if typ == "domain" {
-			// DomainConfigurator: sld + tld are required; the API never takes a full "name".
-			for _, key := range []string{"sld", "tld"} {
-				if v, _ := it[key].(string); v == "" {
-					resp := invalidField(fmt.Sprintf("items.%d.%s", i, key), "The "+key+" field is required.")
-					return nil, &resp
-				}
-			}
-			name := domainName(it)
-			if st.UnavailableDomains[name] {
-				resp := Fail(http.StatusUnprocessableEntity, "DOMAIN_UNAVAILABLE", fmt.Sprintf("Die Domain %s ist nicht registrierbar.", name),
-					map[string]any{"domain": name})
-				return nil, &resp
+			// DomainConfigurator (API mode); the API never takes a full "name".
+			if errResp := st.validateDomainItem(i, it); errResp != nil {
+				return nil, errResp
 			}
 		}
 		if errResp := st.validateServerItem(i, typ, it); errResp != nil {
@@ -311,6 +306,8 @@ func handlePlaceOrder(st *State, r *Request) Response {
 		attrs["expires_at"] = time.Now().AddDate(0, it.months, 0).UTC().Format(time.RFC3339)
 		if resType == ResourceRootserver {
 			st.fulfillRootserver(it.typ, attrs)
+		} else {
+			st.fulfillDomain(attrs)
 		}
 		if fn := st.Provisioners[resType]; fn != nil {
 			fn(it.item, attrs)

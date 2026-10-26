@@ -42,6 +42,14 @@ func serverItem() map[string]any {
 	}
 }
 
+// seedContact12 stores the domain contact domainItem refers to (the API
+// requires contact_id to name a contact of the account).
+func seedContact12(api *testapi.Server) {
+	api.With(func(st *testapi.State) {
+		st.PutResource(testapi.ResourceDomainContact, 12, map[string]any{"name": "Max", "email": "max@example.com"})
+	})
+}
+
 func domainItem() map[string]any {
 	return map[string]any{
 		"type":            "domain",
@@ -171,6 +179,7 @@ func TestOrderResource_Success(t *testing.T) {
 
 func TestOrderResource_Domain(t *testing.T) {
 	api := testapi.New(t)
+	seedContact12(api)
 	api.SetBalance(100)
 	c := orderTestClient(api)
 
@@ -521,6 +530,7 @@ func TestOrderResource_ErrorDiagnostics(t *testing.T) {
 
 func TestOrderResource_DomainUnavailable(t *testing.T) {
 	api := testapi.New(t)
+	seedContact12(api)
 	api.SetBalance(100)
 	api.SetDomainUnavailable("example.de")
 	c := orderTestClient(api)
