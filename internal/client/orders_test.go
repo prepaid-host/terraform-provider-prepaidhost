@@ -17,7 +17,7 @@ import (
 func rootserverItem(hostname string) map[string]any {
 	return map[string]any{
 		"type":             "rootpacket",
-		"packet_id":        3,
+		"packet_id":        2,
 		"duration_months":  1,
 		"template_id":      12,
 		"hostname":         hostname,

@@ -63,6 +63,7 @@ type State struct {
 
 	nextID    int64
 	nextOrder int
+	nextIP    int
 }
 
 // IdempotencyEntry is a used Idempotency-Key.

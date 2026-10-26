@@ -159,6 +159,9 @@ func (st *State) price(body *orderBody) (*pricing, *Response) {
 				return nil, &resp
 			}
 		}
+		if errResp := st.validateServerItem(i, typ, it); errResp != nil {
+			return nil, errResp
+		}
 		ref := reference(it)
 		if ref != nil {
 			if seen[*ref] {
@@ -306,6 +309,9 @@ func handlePlaceOrder(st *State, r *Request) Response {
 		attrs["auto_renew"] = true
 		attrs["created_at"] = nowRFC3339()
 		attrs["expires_at"] = time.Now().AddDate(0, it.months, 0).UTC().Format(time.RFC3339)
+		if resType == ResourceRootserver {
+			st.fulfillRootserver(it.typ, attrs)
+		}
 		if fn := st.Provisioners[resType]; fn != nil {
 			fn(it.item, attrs)
 		}
@@ -353,9 +359,13 @@ func (o *Order) present(st *State, poll bool) map[string]any {
 		if it.ForcedStatus != "" {
 			s = it.ForcedStatus
 		}
-		if _, exists := st.Resource(it.ResourceType, it.ResourceID); !exists {
+		attrs, exists := st.Resource(it.ResourceType, it.ResourceID)
+		if !exists {
 			// The API reports an item whose resource no longer exists as failed.
 			s = "failed"
+		} else if s == "active" && it.ResourceType == ResourceRootserver {
+			// The API derives a server item's status from vServer::installed.
+			attrs["installed"] = true
 		}
 		if statusRank[s] > statusRank[overall] {
 			overall = s

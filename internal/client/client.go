@@ -141,7 +141,23 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, out any,
 	return err
 }
 
+// DoRaw is Do for the older endpoints that answer success without the
+// envelope — a bare object or array, e.g. GET /rootserver/{id}/rental and
+// GET /rootserver/{id}/addresses. The whole body is decoded into out. Error
+// answers (HTTP >= 400, or any {"success":false,...}) are decoded like Do's,
+// so client.IsNotFound works the same. Retries follow Do's rules.
+func (c *Client) DoRaw(ctx context.Context, method, path string, body any, out any) error {
+	_, err := c.send(ctx, method, path, body, out, nil, decodeRaw)
+	return err
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body any, out any, headers map[string]string) (http.Header, error) {
+	return c.send(ctx, method, path, body, out, headers, decode)
+}
+
+type decoder func(status int, raw []byte, out any) error
+
+func (c *Client) send(ctx context.Context, method, path string, body any, out any, headers map[string]string, dec decoder) (http.Header, error) {
 	var payload []byte
 	if body != nil {
 		var err error
@@ -162,7 +178,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any,
 			}
 		}
 
-		header, err := c.once(ctx, method, url, payload, out, headers)
+		header, err := c.once(ctx, method, url, payload, out, headers, dec)
 		if err == nil {
 			return header, nil
 		}
@@ -174,7 +190,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any,
 	}
 }
 
-func (c *Client) once(ctx context.Context, method, url string, payload []byte, out any, headers map[string]string) (http.Header, error) {
+func (c *Client) once(ctx context.Context, method, url string, payload []byte, out any, headers map[string]string, dec decoder) (http.Header, error) {
 	var reqBody io.Reader
 	if payload != nil {
 		reqBody = bytes.NewReader(payload)
@@ -211,7 +227,7 @@ func (c *Client) once(ctx context.Context, method, url string, payload []byte, o
 			method, url, resp.StatusCode, resp.Header.Get("Location"))
 	}
 
-	return resp.Header, decode(resp.StatusCode, raw, out)
+	return resp.Header, dec(resp.StatusCode, raw, out)
 }
 
 type envelope struct {
@@ -238,6 +254,24 @@ func decode(status int, raw []byte, out any) error {
 	}
 	if err := json.Unmarshal(env.Result, out); err != nil {
 		return fmt.Errorf("decoding result: %w", err)
+	}
+	return nil
+}
+
+// decodeRaw decodes a body without envelope; see DoRaw.
+func decodeRaw(status int, raw []byte, out any) error {
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err == nil && env.Success != nil && (status >= 400 || !*env.Success) {
+		return envelopeError(status, env)
+	}
+	if status >= 400 {
+		return &APIError{Status: status, Message: snippet(raw)}
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("decoding response (HTTP %d): %w: %s", status, err, snippet(raw))
 	}
 	return nil
 }

@@ -142,6 +142,7 @@ func (p *PrepaidHostProvider) Resources(_ context.Context) []func() resource.Res
 	return []func() resource.Resource{
 		NewDomainContactResource,
 		NewSSHKeyResource,
+		NewVserverResource,
 	}
 }
 
